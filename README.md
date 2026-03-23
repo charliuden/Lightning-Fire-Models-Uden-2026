@@ -1,9 +1,10 @@
 # A paleoclimate-compatible framework for modeling lightning-caused ignition probability in Alaska
 
 Charlotte Uden, Patrick Clemins, Brian Beckage
+
 March 23rd 2026
 
-This Github repository contains code used in Uden et al., 20206. It includes scripts for:
+This Github repository contains code used in Uden et al., 2026. It includes scripts for:
 - Preprocessing lightning, wildfire, climate, fuel moisture, and land cover data 
 - Training lighting prediction, ignition efficiency, and fire probability models
 - Generating figures used in the manuscript
