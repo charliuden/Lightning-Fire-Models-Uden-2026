@@ -23,11 +23,19 @@ For the purpose of downstream paleo applications of our models, we reclassified 
 
 ## References
 [1]	U.S. Department of the Interior, Bureau of Land Management (BLM), “BLM AFS Impact System Lightning 1986-2012 Points, NAD83.” Mar. 07, 2024. [Online]. Available: https://fire.ak.blm.gov/predsvcs/maps.php 
+
 [2]	U.S. Department of the Interior, Bureau of Land Management (BLM), “BLM AFS TOA Lightning 2012-2025 Points, WGS84.” Oct. 06, 2025. [Vector digital data]. Available: https://fire.ak.blm.gov/predsvcs/maps.php 
+
 [3]	R. C. Scholten, S. Veraverbeke, R. Jandt, E. A. Miller, and B. M. Rogers, “ABoVE: Ignitions, Burned Area, and Emissions of Fires in AK, YT, and NWT, 2001-2018,” ORNL Distrib. Act. Arch. Cent. DAAC Dataset 103334ORNLDAAC1812 2021, p. 1812, Jan. 2021, doi: 10.3334/ORNLDAAC/1812. 
+
 [4]	H. Hersbach et al., “The ERA5 global reanalysis,” Q. J. R. Meteorol. Soc., vol. 146, no. 730, pp. 1999–2049, 2020, doi: 10.1002/qj.3803. 
+
 [5]	C. E. Van Wagner and T. L. Pickett, Equations and FORTRAN program for the Canadian Forest Fire Weather Index System. 1985. Accessed: Mar. 15, 2026. [Online]. Available: https://ostrnrcan-dostrncan.canada.ca/handle/1845/228362 
+
 [6]	Commission for Environmental Cooperation (CEC), “NALCMS. The North American Land Change Monitoring System — A trinational collaboration of more than 21 million square kilometers.” Sep. 25, 2024. [2005, 2010, 2015, and 2025 raster digital data]. Available: https://www.cec.org/north-american-environmental-atlas/?_atlas_keyword=land-cover 
+
 [7]	A. Dawson et al., “Holocene land cover change in North America: continental trends, regional drivers, and implications for vegetation–atmosphere feedbacks,” Clim. Past, vol. 21, no. 11, pp. 2031–2060, Nov. 2025, doi: 10.5194/cp-21-2031-2025. 
+
 [8]	B. Pirzamanbein, J. Lindström, A. Poska, and M.-J. Gaillard, “Modelling Spatial Compositional Data: Reconstructions of past land cover and uncertainties,” Spat. Stat., vol. 24, pp. 14–31, Apr. 2018, doi: 10.1016/j.spasta.2018.03.005. 
+
 [9]	B. Pirzamanbein, A. Poska, and J. Lindström, “Bayesian Reconstruction of Past Land Cover From Pollen Data: Model Robustness and Sensitivity to Auxiliary Variables,” Earth Space Sci., vol. 7, no. 1, p. e2018EA00057, 2020, doi: 10.1029/2018EA000547. 
