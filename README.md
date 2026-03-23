@@ -9,7 +9,10 @@ This Github repository contains code used in Uden et al., 2026. It includes scri
 - Training lighting prediction, ignition efficiency, and fire probability models
 - Generating figures used in the manuscript
 
-Most data used for this analysis can be downloaded from Zenodo:  A sample configuration file compatible with the Zenodo repository file structure can be edited to match data on your local machine. 
+Data used for this analysis can be downloaded from Zenodo:
+Uden, C. (2026). Lightning-caused fire modeling data for Uden et al. (2026) (Version 1) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.19193051  
+
+The sample configuration file provided is compatible with the Zenodo repository file structure. Unprocessed ERA5 cliamte data, and Alaska lightnign data are not included and must be downloaded directly from their websites (see citations below). 
 
 ## Data
 ### Lightning 
