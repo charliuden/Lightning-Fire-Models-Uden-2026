@@ -6,11 +6,11 @@ March 23rd 2026
 This Github repository contains code used in Uden et al., 20206. It includes scripts for:
 - Preprocessing lightning, wildfire, climate, fuel moisture, and land cover data 
 - Training lighting prediction, ignition efficiency, and fire probability models
--Generating figures used in the manuscript
+- Generating figures used in the manuscript
 
 Most data used for this analysis can be downloaded from Zenodo:  A sample configuration file compatible with the Zenodo repository file structure can be edited to match data on your local machine. 
 
-##Data
+## Data
 ### Lightning 
 Lightning strike data, including location and time, were obtained from the Alaska Lightning Detection Network (ALDN), maintained by the Alaska Fire Service (AFS) [1], [2]. We used two datasets, the second reflecting a major upgrade, to the detection network: an earlier dataset (2002-2011) and a newer dataset (2012-2018). From 2002-2011, lightning was detected using an impact-based system that reported cloud-to-ground lightning primarily as flashes. During this period, changes in sensor technology, processing software, and network configuration resulted in variable detection efficiency and relatively coarse spatial accuracy, particularly in remote regions of Alaska. As a result, this dataset is characterized by lower positional accuracy. Beginning in 2012, the ALDN transitioned to a time-of-arrival (TOA)-based system. The TOA system records individual strokes and includes cloud-to-ground. Due to differences in stroke versus flash reporting, expanded sensor coverage, and improved detection range, the AFS reports detecting ~2.25 times more lightning events relative to the earlier systems; there are 1,882,857 strikes in the earlier dataset and 1,784,663 strikes in the later dataset. Due to these differences in detection methods and accuracy, we train and test our models on each time period separately. 
 ### Wildfires
