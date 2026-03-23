@@ -1,0 +1,45 @@
+# A paleoclimate-compatible framework for modeling lightning-caused ignition probability in Alaska
+
+Charlotte Uden, Patrick Clemins, Brian Beckage
+
+March 23rd 2026
+
+This Github repository contains code used in Uden et al., 2026. It includes scripts for:
+- Preprocessing lightning, wildfire, climate, fuel moisture, and land cover data 
+- Training lighting prediction, ignition efficiency, and fire probability models
+- Generating figures used in the manuscript
+
+Data used for this analysis can be downloaded from Zenodo:
+Uden, C. (2026). Lightning-caused fire modeling data for Uden et al. (2026) (Version 1) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.19193051  
+
+The sample configuration file provided is compatible with the Zenodo repository file structure. Unprocessed ERA5 cliamte data, and Alaska lightnign data are not included and must be downloaded directly from their websites (see citations below). 
+
+## Data
+### Lightning 
+Lightning strike data, including location and time, were obtained from the Alaska Lightning Detection Network (ALDN), maintained by the Alaska Fire Service (AFS) [1], [2]. We used two datasets, the second reflecting a major upgrade, to the detection network: an earlier dataset (2002-2011) and a newer dataset (2012-2018). From 2002-2011, lightning was detected using an impact-based system that reported cloud-to-ground lightning primarily as flashes. During this period, changes in sensor technology, processing software, and network configuration resulted in variable detection efficiency and relatively coarse spatial accuracy, particularly in remote regions of Alaska. As a result, this dataset is characterized by lower positional accuracy. Beginning in 2012, the ALDN transitioned to a time-of-arrival (TOA)-based system. The TOA system records individual strokes and includes cloud-to-ground. Due to differences in stroke versus flash reporting, expanded sensor coverage, and improved detection range, the AFS reports detecting ~2.25 times more lightning events relative to the earlier systems; there are 1,882,857 strikes in the earlier dataset and 1,784,663 strikes in the later dataset. Due to these differences in detection methods and accuracy, we train and test our models on each time period separately. 
+### Wildfires
+Wildfire ignition data were obtained from the Alaska-Yukon-Northwest Territories Fire Emissions Database (AKFED), version 2, archived at the Oak Ridge National Laboratory Distributed Active Archive Center (Scholten et al., 2021). AKFED provides information on wildfire occurrence across boreal North America from 2002 onward. Fire ignition locations and dates are derived using a combination of large-fire perimeter records and satellite-based fire detections from MODIS. Ignition timing is estimated to within approximately one day, and ignitions are identified at spatial resolutions ranging from 500 m to 1 km, depending on whether a fire is detected from a single pixel or multiple adjacent detections. When multiple active fire detections occur simultaneously the ignition location is defined as the centroid of the detected pixels. 
+### Climate and Fuel Moisture
+We obtained hourly ERA5 reanalysis data on a 0.25° × 0.25° grid for summer months (June–August) from 2002 to 2018 [4]. The dataset includes 2-meter air temperature, 2-meter dewpoint temperature, total precipitation, 10-meter wind gust, surface downward shortwave radiation, and surface pressure (Figure 1a-f). After aggregating to daily means (and daily sums for precipitation), temperature and dewpoint temperature were converted to Celsius and used to calculate relative humidity. We also computed the Canadian Forest Fire Danger Rating System indices following Van Wagner & Pickett (1985) from the ERA5 data. These include daily fine fuel moisture code (FFMC), duff moisture code (DMC), and drought code (DC) (Figure 1g-i). 
+### Land Cover
+We used land-cover data from the North American Land Change Monitoring System (NALCMS) to derive vegetation cover predictors [6]. The NALCMS products provide land cover classification across North America using a standard 19-class legend based on the Land Cover Classification System (LCCS) of the Food and Agriculture Organization of the United States. Four timesteps were used: 2005, 2010, 2015, and 2020. For the years 2005 and 2010, land cover maps are available at 250 m spatial resolution using MODIS satellite imagery. For the 2015 and 2020 datasets, newer generation NALCMS products were produced at 30 m spatial resolution using Landsat multispectral satellite imagery. 
+For the purpose of downstream paleo applications of our models, we reclassified the data from 19 classes to three broad cover types consistent with paleo reconstructions of land cover (REVEALS; [7], [8], [9]). These include conifer (representing temperate or sub-polar needleleaf forests and sub-polar taiga needleleaf forest), broadleaf (tropical/sub-tropical and temperate/sub/polar broadleaf forests), and unforested/open land (shrubland, grassland, polar dwarf vegetation, wetland, barren, and snow/ice). Classes corresponding to cropland, urban land, water, and other non-natural surfaces were excluded. Mixed forest was allocated proportionally into the conifer and broadleaf categories based on the relative prevalence of pure conifer versus broadleaf forest within a gridcell. To match the land cover data to the ERA5 climate and fuel moisture grid, we assigned each land cover pixel to the nearest ERA5 grid cell. Within each ERA5 gridcell, the sum of each reclassified category (conifer, broadleaf, and unforested/open land) was divided by the number of NALCMS pixels so that each cover type is a proportion that sums to 1 (Figure 1j-l). This aligns modern land cover data with available paleo land cover reconstructions.
+
+## References
+[1]	U.S. Department of the Interior, Bureau of Land Management (BLM), “BLM AFS Impact System Lightning 1986-2012 Points, NAD83.” Mar. 07, 2024. [Online]. Available: https://fire.ak.blm.gov/predsvcs/maps.php 
+
+[2]	U.S. Department of the Interior, Bureau of Land Management (BLM), “BLM AFS TOA Lightning 2012-2025 Points, WGS84.” Oct. 06, 2025. [Vector digital data]. Available: https://fire.ak.blm.gov/predsvcs/maps.php 
+
+[3]	R. C. Scholten, S. Veraverbeke, R. Jandt, E. A. Miller, and B. M. Rogers, “ABoVE: Ignitions, Burned Area, and Emissions of Fires in AK, YT, and NWT, 2001-2018,” ORNL Distrib. Act. Arch. Cent. DAAC Dataset 103334ORNLDAAC1812 2021, p. 1812, Jan. 2021, doi: 10.3334/ORNLDAAC/1812. 
+
+[4]	H. Hersbach et al., “The ERA5 global reanalysis,” Q. J. R. Meteorol. Soc., vol. 146, no. 730, pp. 1999–2049, 2020, doi: 10.1002/qj.3803. 
+
+[5]	C. E. Van Wagner and T. L. Pickett, Equations and FORTRAN program for the Canadian Forest Fire Weather Index System. 1985. Accessed: Mar. 15, 2026. [Online]. Available: https://ostrnrcan-dostrncan.canada.ca/handle/1845/228362 
+
+[6]	Commission for Environmental Cooperation (CEC), “NALCMS. The North American Land Change Monitoring System — A trinational collaboration of more than 21 million square kilometers.” Sep. 25, 2024. [2005, 2010, 2015, and 2025 raster digital data]. Available: https://www.cec.org/north-american-environmental-atlas/?_atlas_keyword=land-cover 
+
+[7]	A. Dawson et al., “Holocene land cover change in North America: continental trends, regional drivers, and implications for vegetation–atmosphere feedbacks,” Clim. Past, vol. 21, no. 11, pp. 2031–2060, Nov. 2025, doi: 10.5194/cp-21-2031-2025. 
+
+[8]	B. Pirzamanbein, J. Lindström, A. Poska, and M.-J. Gaillard, “Modelling Spatial Compositional Data: Reconstructions of past land cover and uncertainties,” Spat. Stat., vol. 24, pp. 14–31, Apr. 2018, doi: 10.1016/j.spasta.2018.03.005. 
+
+[9]	B. Pirzamanbein, A. Poska, and J. Lindström, “Bayesian Reconstruction of Past Land Cover From Pollen Data: Model Robustness and Sensitivity to Auxiliary Variables,” Earth Space Sci., vol. 7, no. 1, p. e2018EA00057, 2020, doi: 10.1029/2018EA000547. 
