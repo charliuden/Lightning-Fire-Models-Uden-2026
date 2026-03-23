@@ -1,0 +1,264 @@
+---
+title: "Transforming Observations"
+author: "Charlotte Uden"
+date: "2026-01-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(terra)
+library(sf)
+library(lubridate)
+library(MASS)
+library(fields)
+library(lubridate)
+library(geosphere)
+library(ggspatial)
+library(viridis)
+library(rlang)  
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+data_root <- config[["data_root"]]
+```
+
+This script converts the location and time of observed lightning-caused wildfire in Alaska (2001-2018) to the ERA5 grid. 
+This is for comparison with predictions of lightning caused fires, which are defined as:
+
+P_fire,i,t = P(>= 1 lightning-caused fire in grid cell i on day t)
+
+The observations need to be converted to a binary event: fire occurred or did no occur for comparison with a bernoulli probability (not a rate or count). This is defined on a grid cell x day. So, the observation target should be defined like so:
+
+"Did at least one lightning-caused fire occur in grid cell i on day t?"
+
+So, we must convert the observations to match this by 
+1. snap fire points to model grid (ERA5 grid)
+2. collapse to binary grid cell x day. 
+
+Alaska polygon
+```{r}
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+```
+
+Read in lightning-caused fire observations
+
+```{r}
+#raw fire location data:
+original_sf <- st_read(file.path(data_root, "Alaska_ignition_locations_20012018/ignitions_20012018_AK.shp"))
+original_crs <- st_crs(original_sf)
+
+#fires matched with a lightning strike:
+fire1 <- read.csv(file.path(data_root, "binary_fire_lightning_matches_2002_2011.csv"))
+fire2 <- read.csv(file.path(data_root, "binary_fire_lightning_matches_2012_2018.csv"))
+
+fire <- rbind(fire1, fire2)
+colnames(fire) <- c("X","lightning_date","lat","lon","caused_fire")
+
+fire$lightning_date <- as.Date(fire$lightning_date, format = "%Y-%m-%d")
+
+fire_sf <- st_as_sf(
+  fire %>% filter(caused_fire == 1),   
+  coords = c("lon", "lat"),
+  crs = 4326, #use crs from shapefile we got the original data from (above)
+  remove = FALSE
+)
+
+#to map fire locations, we need the crs to match the alaska ploygon
+fire_sf <- st_transform(fire_sf, st_crs(alaska))
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(data = fire_sf, color = "red", size = 2, alpha=0.1) +
+  theme_minimal() +
+  labs(title = "Fire start locations",
+       x = "Longitude", y = "Latitude")
+```
+
+
+
+ERA5 grid
+```{r}
+grid <- read.csv(file.path(data_root, "era5_grid.csv"))
+
+grid_sf <- st_as_sf(
+  grid %>% mutate(grid_id = X.1),   # or row_number() if you prefer
+  coords = c("X", "Y"),
+  crs = 4326,
+  remove = FALSE
+)
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(data = grid_sf, size=2) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) +
+  theme_minimal() +
+  labs(title = "ERA5 grid",
+       x = "Longitude", y = "Latitude")
+
+# Transform grid to match fires CRS
+grid_sf_firecrs <- st_transform(grid_sf, st_crs(fire_sf))
+```
+
+1. Snap fire points to the model (ERA5) grid. For each lightning-caused fire, assign it to a grid cell and extract the ignition date (day). 
+```{r}
+# Find nearest ERA5 grid point for each fire
+nearest_idx <- st_nearest_feature(fire_sf, grid_sf_firecrs)
+
+fires_gridded <- fire_sf %>%
+  mutate(grid_id = grid_sf_firecrs$grid_id[nearest_idx]) %>%
+  st_drop_geometry()
+
+```
+
+2. Aggregate to binary grid cell x day for occurrance
+```{r}
+obs_grid_day <- fires_gridded %>%
+  group_by(grid_id, lightning_date) %>%
+  summarise(
+    fire = 1L,          # by construction, at least one fire occurred
+    n_fires = n(),      # optional: keep counts for diagnostics
+    .groups = "drop"
+  )
+
+```
+
+3. Create a complete grid / day table that incldues zeros. 
+```{r}
+date_min <- min(fires_gridded$lightning_date, na.rm = TRUE)
+date_max <- max(fires_gridded$lightning_date, na.rm = TRUE)
+
+all_days <- seq.Date(date_min, date_max, by = "day")
+
+obs_grid_day_full <- tidyr::expand_grid(
+  grid_id = grid_sf$grid_id,
+  lightning_date = all_days
+) %>%
+  left_join(obs_grid_day %>% dplyr::select(grid_id, lightning_date, fire),
+            by = c("grid_id", "lightning_date")) %>%
+  mutate(fire = ifelse(is.na(fire), 0L, fire))
+
+head(obs_grid_day_full)
+```
+
+4. Sanity checks
+
+```{r}
+# How many fires got a grid cell?
+sum(is.na(fires_gridded$grid_id))
+
+# How many unique gridcells have >=1 fire?
+n_distinct(obs_grid_day$grid_id)
+
+# Any days with multiple fires in same grid cell?
+obs_grid_day %>% filter(n_fires > 1) %>% arrange(desc(n_fires)) %>% head()
+
+```
+5. Merge with grid lat lon by grid id
+```{r}
+obs_grid_day_full_sf <- obs_grid_day_full %>%
+  left_join(
+    grid_sf_firecrs %>% dplyr::select(grid_id, geometry),
+    by = "grid_id"
+  ) %>%
+  sf::st_as_sf()
+
+#get explicit lat lon values
+obs_grid_day_full_sf <- obs_grid_day_full_sf %>%
+  mutate(
+    lon = sf::st_coordinates(.)[, 1],
+    lat = sf::st_coordinates(.)[, 2]
+  )
+
+str(obs_grid_day_full_sf)
+
+#plot just 2002
+obs_2002 <- obs_grid_day_full_sf %>%
+  filter(lubridate::year(lightning_date) == 2002)
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(
+    data = obs_2002,
+    aes(color = factor(fire), alpha=0.1, size=2)
+  ) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) +
+  theme_minimal() +
+  labs(
+    title = "Binary Lightning-Caused Fire Observations (2001)",
+    color = "Fire"
+  )
+
+#plot only fires for 2002
+obs_2002_fire <- obs_grid_day_full_sf %>%
+  filter(lubridate::year(lightning_date) == 2002, fire == 1)
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(
+    data = obs_2002_fire,
+    color = "red",
+    size = 2
+  ) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) +
+  theme_minimal() +
+  labs(
+    title = "Lightning-Caused Fire Grid Cells (2001)"
+  )
+```
+Final product:
+
+obs_grid_day_full_sf contains one row per grid cell per day, with:
+
+grid_id: unique ERA5 grid cell identifier
+
+fire_date: calendar day (summer season)
+
+fire: binary indicator: 1 if >= lightning-caused fire occurred in that frid cell on that day, 0 no fire
+
+geometry: point geometry of the ERA5 grid cell (for mapping / spatial joins)
+
+My model says: "Given the climate and lightning regime, what is the probability that at least one lightning-caused fire occurs here today?"
+
+Save dataset:
+```{r}
+st_write(
+  obs_grid_day_full_sf,
+  file.path(model_drivers, "observed_binary_fire_data_2002-2018.shp"),
+  delete_layer = TRUE
+)
+```

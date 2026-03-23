@@ -1,0 +1,1521 @@
+---
+title: "Applying Hessilt et al. (2022) Methods"
+author: "Charlotte Uden"
+date: "2025-11-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(glmnet)
+library(caret) 
+library(pROC)
+library(sf)
+library(gridExtra)
+library(dplyr)
+
+#for bayes models:
+library(rstan)
+library(pROC)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+```
+
+############################################
+############################################
+# GLMNET Penalized logistic regression 
+############################################
+############################################
+
+#----------------------------
+## Data for 2002 - 2011
+#----------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+df <- na.omit(df) 
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+Function to apply the penalized logistic ridge regression to lightning caused fire data
+
+inputs:
+1. dataset
+2. vector of predictor variables you would like to apply
+3. response variable
+4. alpha (ridge or lass0)
+5. fraction of data to put in the train set
+6. seed to be set to (keep this the same for all models)
+7. number of folds for cross validation
+
+funcitons:
+computes training means/SDs
+stores them in the output list
+applies them to training and test sets
+fits glmnet with standardize = FALSE
+
+returns:
+1. coefficents
+2. predictions
+3. perfomance metrics
+4. standardization values (means and sd for each predictor) for future model application
+4. a helper function to standardize future data identically
+
+
+```{r}
+#library(glmnet)
+#library(pROC)
+
+library(glmnet)
+library(pROC)
+
+fit_penalized_logit <- function(data,
+                                predictors,
+                                response = "caused_fire",
+                                alpha = 0,          # 0 = ridge, 1 = lasso
+                                train_frac = 0.8,
+                                seed = 123,
+                                nfolds = 5,
+                                boot = TRUE,
+                                n_boot = 1000) {
+  
+  # ---- helper: PR-AUC (average precision style) ---------------------------
+  pr_auc_ap <- function(y_true, p_hat) {
+    o <- order(p_hat, decreasing = TRUE)
+    y <- y_true[o]
+    tp <- cumsum(y == 1)
+    fp <- cumsum(y == 0)
+    total_pos <- sum(y == 1)
+    if (total_pos == 0) return(NA_real_)
+    recall <- tp / total_pos
+    precision <- tp / (tp + fp)
+    recall_prev <- c(0, recall[-length(recall)])
+    sum((recall - recall_prev) * precision)
+  }
+  
+  # ---- helper: calibration intercept & slope ------------------------------
+  calibration_stats <- function(y_true, p_hat) {
+    eps <- 1e-6
+    p_clipped <- pmin(pmax(p_hat, eps), 1 - eps)
+    logit_p <- qlogis(p_clipped)
+    cal_fit <- glm(y_true ~ logit_p, family = binomial())
+    coefs <- coef(cal_fit)
+    list(
+      intercept = unname(coefs[1]),
+      slope     = unname(coefs["logit_p"])
+    )
+  }
+  
+  # 1. Train/test split -------------------------------------------------------
+  set.seed(seed)
+  n <- nrow(data)
+  train_size <- floor(train_frac * n)
+  train_index <- sample(seq_len(n), size = train_size)
+  
+  train <- data[train_index, , drop = FALSE]
+  test  <- data[-train_index, , drop = FALSE]
+  
+  # 2. Compute scaling values (mean/sd) from training data -------------------
+  scale_values <- train[, predictors, drop = FALSE] |>
+    lapply(function(x) c(mean = mean(x), sd = sd(x))) |>
+    do.call(what = rbind)
+  
+  # Standardization helper
+  standardize_df <- function(df) {
+    out <- df
+    for (p in predictors) {
+      m <- scale_values[p, "mean"]
+      s <- scale_values[p, "sd"]
+      out[[p]] <- (out[[p]] - m) / s
+    }
+    out
+  }
+  
+  train_std <- standardize_df(train)
+  test_std  <- standardize_df(test)
+  
+  # 3. Build model matrices ---------------------------------------------------
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  x_train <- model.matrix(formula_obj, data = train_std)[, -1, drop = FALSE]
+  y_train <- train_std[[response]]
+  
+  x_test  <- model.matrix(formula_obj, data = test_std)[, -1, drop = FALSE]
+  y_test  <- test_std[[response]]
+  
+  # 4. Fit penalized logistic regression -------------------------------------
+  cv_fit <- cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = alpha,
+    nfolds = nfolds,
+    type.measure = "deviance",
+    standardize = FALSE   # we already did it
+  )
+  
+  best_lambda <- cv_fit$lambda.1se
+  
+  # 5. Extract coefficients ---------------------------------------------------
+  coef_mat <- coef(cv_fit, s = best_lambda)
+  coef_df <- data.frame(
+    term = rownames(coef_mat),
+    estimate = as.numeric(coef_mat),
+    row.names = NULL
+  )
+  
+  # 6. Predictions ------------------------------------------------------------
+  prob_test <- as.numeric(
+    predict(cv_fit, newx = x_test, s = best_lambda, type = "response")
+  )
+  class_test <- ifelse(prob_test >= 0.5, 1L, 0L)
+  
+  # 7. Point-estimate performance metrics ------------------------------------
+  roc_obj <- roc(response = y_test, predictor = prob_test)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  accuracy <- mean(class_test == y_test)
+  brier <- mean((prob_test - y_test)^2)
+  pr_auc_val <- pr_auc_ap(y_test, prob_test)
+  cal <- calibration_stats(y_test, prob_test)
+  
+  # 8. Bootstrap CIs (optional) ----------------------------------------------
+  AUC_CI <- PR_AUC_CI <- ACC_CI <- Brier_CI <- 
+    calib_int_CI <- calib_slope_CI <- c(NA_real_, NA_real_)
+  
+  if (boot) {
+    n_test <- length(y_test)
+    AUC_boot   <- numeric(n_boot)
+    PR_boot    <- numeric(n_boot)
+    ACC_boot   <- numeric(n_boot)
+    Brier_boot <- numeric(n_boot)
+    INT_boot   <- numeric(n_boot)
+    SLOPE_boot <- numeric(n_boot)
+    
+    for (b in seq_len(n_boot)) {
+      idx <- sample.int(n_test, n_test, replace = TRUE)
+      y_b <- y_test[idx]
+      p_b <- prob_test[idx]
+      c_b <- ifelse(p_b >= 0.5, 1L, 0L)
+      
+      # AUC
+      if (length(unique(y_b)) == 2) {
+        AUC_boot[b] <- tryCatch(
+          as.numeric(auc(roc(response = y_b, predictor = p_b))),
+          error = function(e) NA_real_
+        )
+      } else {
+        AUC_boot[b] <- NA_real_
+      }
+      
+      # PR-AUC
+      PR_boot[b] <- pr_auc_ap(y_b, p_b)
+      
+      # Accuracy
+      ACC_boot[b] <- mean(c_b == y_b)
+      
+      # Brier
+      Brier_boot[b] <- mean((p_b - y_b)^2)
+      
+      # Calibration
+      cal_b <- tryCatch(
+        calibration_stats(y_b, p_b),
+        error = function(e) list(intercept = NA_real_, slope = NA_real_)
+      )
+      INT_boot[b]   <- cal_b$intercept
+      SLOPE_boot[b] <- cal_b$slope
+    }
+    
+    qfun <- function(x) quantile(x[is.finite(x) & !is.na(x)], probs = c(0.025, 0.975))
+    
+    if (any(is.finite(AUC_boot)))       AUC_CI       <- qfun(AUC_boot)
+    if (any(is.finite(PR_boot)))        PR_AUC_CI    <- qfun(PR_boot)
+    if (any(is.finite(ACC_boot)))       ACC_CI       <- qfun(ACC_boot)
+    if (any(is.finite(Brier_boot)))     Brier_CI     <- qfun(Brier_boot)
+    if (any(is.finite(INT_boot)))       calib_int_CI <- qfun(INT_boot)
+    if (any(is.finite(SLOPE_boot)))     calib_slope_CI <- qfun(SLOPE_boot)
+  }
+  
+  # 9. Return everything ------------------------------------------------------
+  list(
+    call = match.call(),
+    formula = formula_obj,
+    predictors = predictors,
+    alpha = alpha,
+    lambda = best_lambda,
+    coefficients = coef_df,
+    scale_values = scale_values,
+    cv_fit = cv_fit,
+    predictions = data.frame(
+      observed = y_test,
+      predicted_prob = prob_test,
+      predicted_class = class_test
+    ),
+    performance = list(
+      AUC = auc_val,
+      AUC_CI = AUC_CI,
+      PR_AUC = pr_auc_val,
+      PR_AUC_CI = PR_AUC_CI,
+      accuracy = accuracy,
+      accuracy_CI = ACC_CI,
+      Brier = brier,
+      Brier_CI = Brier_CI,
+      calib_intercept = cal$intercept,
+      calib_intercept_CI = calib_int_CI,
+      calib_slope = cal$slope,
+      calib_slope_CI = calib_slope_CI
+    ),
+    standardize_newdata = function(newdata) {
+      out <- newdata
+      for (p in predictors) {
+        m <- scale_values[p, "mean"]
+        s <- scale_values[p, "sd"]
+        out[[p]] <- (out[[p]] - m) / s
+      }
+      out
+    }
+  )
+}
+
+
+```
+
+M1: climate only
+
+```{r}
+predictors_m1 <- c("temperature", "precipitation", "wind",
+                   "relative_humidity")
+
+m1 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m1,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M2: fuel moisture only
+
+```{r}
+predictors_m2 <- c("FFMC", "DMC", "DC")
+
+m2 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m2,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M3: Vegetation type/cover only
+
+```{r}
+predictors_m3 <- c("C", "B", "U")
+
+m3 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m3,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m3$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M4: Climate and fuel moisture
+
+```{r}
+predictors_m4 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC")
+
+m4 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m4,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m4$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+
+M5: Climate and vegetation cover
+
+```{r}
+predictors_m5 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "C", "B", "U")
+
+m5 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m5,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m5$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M6: fuel moisture and vegetation cover
+
+```{r}
+predictors_m6 <- c("FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+
+m6 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m6,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m6$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M7: Climate, fuel moisture, and vegetation type/cover
+
+```{r}
+predictors_m7 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+
+m7 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m7,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m7$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+Compare Performance
+
+```{r}
+model <- c("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+training_years <- rep("2001-2012", 7)
+approach <- rep("glmnet", 7)
+predictors <- c("climate", "fuel moisture", "vegetation", "climate & fuel moisture", "climate & vegetation", "fuel moisture & vegetation", "climate, fuel moisture & vegetation")
+
+AUC <- c(m1$performance$AUC, m2$performance$AUC, m3$performance$AUC, m4$performance$AUC, m5$performance$AUC, m6$performance$AUC, m7$performance$AUC)
+
+PR_AUC <- c(m1$performance$PR_AUC, m2$performance$PR_AUC, m3$performance$PR_AUC, m4$performance$PR_AUC, m5$performance$PR_AUC, m6$performance$PR_AUC, m7$performance$PR_AUC)
+
+accuracy <- c(m1$performance$accuracy, m2$performance$accuracy, m3$performance$accuracy, m4$performance$accuracy, m5$performance$accuracy, m6$performance$accuracy, m7$performance$accuracy)
+
+Brier <- c(m1$performance$Brier, m2$performance$Brier, m3$performance$Brier, m4$performance$Brier, m5$performance$Brier, m6$performance$Brier, m7$performance$Brier)
+
+calib_intercept <- c(m1$performance$calib_intercept, m2$performance$calib_intercept, m3$performance$calib_intercept, m4$performance$calib_intercept, m5$performance$calib_intercept, m6$performance$calib_intercept, m7$performance$calib_intercept)
+
+calib_slope <- c(m1$performance$calib_slope, m2$performance$calib_slope, m3$performance$calib_slope, m4$performance$calib_slope, m5$performance$calib_slope, m6$performance$calib_slope, m7$performance$calib_slope)
+
+#confidence intervals
+AUC_CI_low <- c(m1$performance$AUC_CI[1], m2$performance$AUC_CI[1], m3$performance$AUC_CI[1], m4$performance$AUC_CI[1], m5$performance$AUC_CI[1], m6$performance$AUC_CI[1], m7$performance$AUC_CI[1])
+AUC_CI_high <- c(m1$performance$AUC_CI[2], m2$performance$AUC_CI[2], m3$performance$AUC_CI[2], m4$performance$AUC_CI[2], m5$performance$AUC_CI[2], m6$performance$AUC_CI[2], m7$performance$AUC_CI[2])
+
+PR_AUC_CI_low <- c(m1$performance$PR_AUC_CI[1], m2$performance$PR_AUC_CI[1], m3$performance$PR_AUC_CI[1], m4$performance$PR_AUC_CI[1], m5$performance$PR_AUC_CI[1], m6$performance$PR_AUC_CI[1], m7$performance$PR_AUC_CI[1])
+PR_AUC_CI_high <- c(m1$performance$PR_AUC_CI[2], m2$performance$PR_AUC_CI[2], m3$performance$PR_AUC_CI[2], m4$performance$PR_AUC_CI[2], m5$performance$PR_AUC_CI[2], m6$performance$PR_AUC_CI[2], m7$performance$PR_AUC_CI[2])
+
+Brier_CI_low <- c(m1$performance$Brier_CI[1], m2$performance$Brier_CI[1], m3$performance$Brier_CI[1], m4$performance$Brier_CI[1], m5$performance$Brier_CI[1], m6$performance$Brier_CI[1], m7$performance$Brier_CI[1])
+Brier_CI_high <- c(m1$performance$Brier_CI[2], m2$performance$Brier_CI[2], m3$performance$Brier_CI[2], m4$performance$Brier_CI[2], m5$performance$Brier_CI[2], m6$performance$Brier_CI[2], m7$performance$Brier_CI[2])
+
+calib_intercept_CI_low <- c(m1$performance$calib_intercept_CI[1], m2$performance$calib_intercept_CI[1], m3$performance$calib_intercept_CI[1], m4$performance$calib_intercept_CI[1], m5$performance$calib_intercept_CI[1], m6$performance$calib_intercept_CI[1], m7$performance$calib_intercept_CI[1])
+calib_intercept_CI_high <- c(m1$performance$calib_intercept_CI[2], m2$performance$calib_intercept_CI[2], m3$performance$calib_intercept_CI[2], m4$performance$calib_intercept_CI[2], m5$performance$calib_intercept_CI[2], m6$performance$calib_intercept_CI[2], m7$performance$calib_intercept_CI[2])
+
+calib_slope_CI_low <- c(m1$performance$calib_slope_CI[1], m2$performance$calib_slope_CI[1], m3$performance$calib_slope_CI[1], m4$performance$calib_slope_CI[1], m5$performance$calib_slope_CI[1], m6$performance$calib_slope_CI[1], m7$performance$calib_slope_CI[1])
+calib_slope_CI_high <- c(m1$performance$calib_slope_CI[2], m2$performance$calib_slope_CI[2], m3$performance$calib_slope_CI[2], m4$performance$calib_slope_CI[2], m5$performance$calib_slope_CI[2], m6$performance$calib_slope_CI[2], m7$performance$calib_slope_CI[2])
+
+df_performance_1 <- as.data.frame(cbind(model, training_years, approach, predictors, AUC, PR_AUC, accuracy, Brier, calib_intercept, calib_slope, AUC_CI_low, AUC_CI_high, PR_AUC_CI_low, PR_AUC_CI_high, Brier_CI_low, Brier_CI_high, calib_intercept_CI_low, calib_intercept_CI_high, calib_slope_CI_low, calib_slope_CI_high))
+
+p1 <- ggplot(data=df_performance_1, aes(y=AUC, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p2 <- ggplot(data=df_performance_1, aes(y=accuracy, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p3 <- ggplot(data=df_performance_1, aes(y=Brier, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p1 + p2 + p3
+```
+
+#----------------------------
+## Data for 2012 - 2018
+#----------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2012_2018_10x.csv")
+df <- read.csv(drivers_file_path)
+
+df <- na.omit(df) 
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+M1: climate only
+
+```{r}
+predictors_m1 <- c("temperature", "precipitation", "wind",
+                   "relative_humidity")
+
+m1 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m1,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M2: fuel moisture only
+
+```{r}
+predictors_m2 <- c("FFMC", "DMC", "DC")
+
+m2 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m2,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M3: Vegetation type/cover only
+
+```{r}
+predictors_m3 <- c("C", "B", "U")
+
+m3 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m3,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m3$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+
+M4: Climate and fuel moisture
+
+```{r}
+predictors_m4 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC")
+
+m4 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m4,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m4$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+
+M5: Climate and vegetation cover
+
+```{r}
+predictors_m5 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "C", "B", "U")
+
+m5 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m5,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m5$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M6: fuel moisture and vegetation cover
+
+```{r}
+predictors_m6 <- c("FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+
+m6 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m6,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m6$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+M7: Climate, fuel moisture, and vegetation type/cover
+
+```{r}
+predictors_m7 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+
+m7 <- fit_penalized_logit(
+  data       = df,
+  predictors = predictors_m7,
+  response   = "caused_fire",
+  alpha      = 0  # ridge, like Hessilt et al.
+)
+
+ggplot() + geom_point(data=m7$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("Observed vs. Predicted") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+```
+
+Compare models
+
+```{r}
+model <- c("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+training_years <- rep("2012-2018", 7)
+approach <- rep("glmnet", 7)
+predictors <- c("climate", "fuel moisture", "vegetation", "climate & fuel moisture", "climate & vegetation", "fuel moisture & vegetation", "climate, fuel moisture & vegetation")
+
+AUC <- c(m1$performance$AUC, m2$performance$AUC, m3$performance$AUC, m4$performance$AUC, m5$performance$AUC, m6$performance$AUC, m7$performance$AUC)
+
+PR_AUC <- c(m1$performance$PR_AUC, m2$performance$PR_AUC, m3$performance$PR_AUC, m4$performance$PR_AUC, m5$performance$PR_AUC, m6$performance$PR_AUC, m7$performance$PR_AUC)
+
+accuracy <- c(m1$performance$accuracy, m2$performance$accuracy, m3$performance$accuracy, m4$performance$accuracy, m5$performance$accuracy, m6$performance$accuracy, m7$performance$accuracy)
+
+Brier <- c(m1$performance$Brier, m2$performance$Brier, m3$performance$Brier, m4$performance$Brier, m5$performance$Brier, m6$performance$Brier, m7$performance$Brier)
+
+calib_intercept <- c(m1$performance$calib_intercept, m2$performance$calib_intercept, m3$performance$calib_intercept, m4$performance$calib_intercept, m5$performance$calib_intercept, m6$performance$calib_intercept, m7$performance$calib_intercept)
+
+calib_slope <- c(m1$performance$calib_slope, m2$performance$calib_slope, m3$performance$calib_slope, m4$performance$calib_slope, m5$performance$calib_slope, m6$performance$calib_slope, m7$performance$calib_slope)
+
+#confidence intervals
+AUC_CI_low <- c(m1$performance$AUC_CI[1], m2$performance$AUC_CI[1], m3$performance$AUC_CI[1], m4$performance$AUC_CI[1], m5$performance$AUC_CI[1], m6$performance$AUC_CI[1], m7$performance$AUC_CI[1])
+AUC_CI_high <- c(m1$performance$AUC_CI[2], m2$performance$AUC_CI[2], m3$performance$AUC_CI[2], m4$performance$AUC_CI[2], m5$performance$AUC_CI[2], m6$performance$AUC_CI[2], m7$performance$AUC_CI[2])
+
+PR_AUC_CI_low <- c(m1$performance$PR_AUC_CI[1], m2$performance$PR_AUC_CI[1], m3$performance$PR_AUC_CI[1], m4$performance$PR_AUC_CI[1], m5$performance$PR_AUC_CI[1], m6$performance$PR_AUC_CI[1], m7$performance$PR_AUC_CI[1])
+PR_AUC_CI_high <- c(m1$performance$PR_AUC_CI[2], m2$performance$PR_AUC_CI[2], m3$performance$PR_AUC_CI[2], m4$performance$PR_AUC_CI[2], m5$performance$PR_AUC_CI[2], m6$performance$PR_AUC_CI[2], m7$performance$PR_AUC_CI[2])
+
+Brier_CI_low <- c(m1$performance$Brier_CI[1], m2$performance$Brier_CI[1], m3$performance$Brier_CI[1], m4$performance$Brier_CI[1], m5$performance$Brier_CI[1], m6$performance$Brier_CI[1], m7$performance$Brier_CI[1])
+Brier_CI_high <- c(m1$performance$Brier_CI[2], m2$performance$Brier_CI[2], m3$performance$Brier_CI[2], m4$performance$Brier_CI[2], m5$performance$Brier_CI[2], m6$performance$Brier_CI[2], m7$performance$Brier_CI[2])
+
+calib_intercept_CI_low <- c(m1$performance$calib_intercept_CI[1], m2$performance$calib_intercept_CI[1], m3$performance$calib_intercept_CI[1], m4$performance$calib_intercept_CI[1], m5$performance$calib_intercept_CI[1], m6$performance$calib_intercept_CI[1], m7$performance$calib_intercept_CI[1])
+calib_intercept_CI_high <- c(m1$performance$calib_intercept_CI[2], m2$performance$calib_intercept_CI[2], m3$performance$calib_intercept_CI[2], m4$performance$calib_intercept_CI[2], m5$performance$calib_intercept_CI[2], m6$performance$calib_intercept_CI[2], m7$performance$calib_intercept_CI[2])
+
+calib_slope_CI_low <- c(m1$performance$calib_slope_CI[1], m2$performance$calib_slope_CI[1], m3$performance$calib_slope_CI[1], m4$performance$calib_slope_CI[1], m5$performance$calib_slope_CI[1], m6$performance$calib_slope_CI[1], m7$performance$calib_slope_CI[1])
+calib_slope_CI_high <- c(m1$performance$calib_slope_CI[2], m2$performance$calib_slope_CI[2], m3$performance$calib_slope_CI[2], m4$performance$calib_slope_CI[2], m5$performance$calib_slope_CI[2], m6$performance$calib_slope_CI[2], m7$performance$calib_slope_CI[2])
+
+df_performance_2 <- as.data.frame(cbind(model, training_years, approach, predictors, AUC, PR_AUC, accuracy, Brier, calib_intercept, calib_slope, AUC_CI_low, AUC_CI_high, PR_AUC_CI_low, PR_AUC_CI_high, Brier_CI_low, Brier_CI_high, calib_intercept_CI_low, calib_intercept_CI_high, calib_slope_CI_low, calib_slope_CI_high))
+
+p1 <- ggplot(data=df_performance_2, aes(y=AUC, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p2 <- ggplot(data=df_performance_2, aes(y=accuracy, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Accuracy")
+
+p3 <- ggplot(data=df_performance_2, aes(y=Brier, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Brier")
+
+p1 + p2 + p3
+```
+
+############################################
+############################################
+# Bayesian Models
+############################################
+############################################
+
+#----------------------------
+## Data for 2002 - 2011
+#----------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv")
+df <- read.csv(drivers_file_path)
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+```{r}
+
+fit_bayes_logit_ridge <- function(data,
+                                  predictors,
+                                  response = "caused_fire",
+                                  train_frac = 0.8,
+                                  seed = 123,
+                                  iter = 2000,
+                                  chains = 4,
+                                  sigma_beta = 1,
+                                  sigma_alpha = 5,
+                                  compiled_model = NULL,
+                                  boot = TRUE,
+                                  n_boot = 1000) {
+  #-------------------------------
+  # 0. Stan model code (inline)
+  #-------------------------------
+  stan_code <- "
+  data {
+    int<lower=1> N;
+    int<lower=1> K;
+    matrix[N, K] X;
+    int<lower=0, upper=1> y[N];
+    real<lower=0> sigma_beta;
+    real<lower=0> sigma_alpha;
+  }
+  parameters {
+    real alpha;
+    vector[K] beta;
+  }
+  model {
+    alpha ~ normal(0, sigma_alpha);
+    beta  ~ normal(0, sigma_beta);
+    y ~ bernoulli_logit(alpha + X * beta);
+  }
+  generated quantities {
+    vector[N] log_lik;
+    for (n in 1:N) {
+      log_lik[n] = bernoulli_logit_lpmf(y[n] | alpha + X[n] * beta);
+    }
+  }"
+  
+  # ---- helper: PR-AUC (average precision style) ---------------------------
+  pr_auc_ap <- function(y_true, p_hat) {
+    o <- order(p_hat, decreasing = TRUE)
+    y <- y_true[o]
+    tp <- cumsum(y == 1)
+    fp <- cumsum(y == 0)
+    total_pos <- sum(y == 1)
+    if (total_pos == 0) return(NA_real_)
+    recall <- tp / total_pos
+    precision <- tp / (tp + fp)
+    recall_prev <- c(0, recall[-length(recall)])
+    sum((recall - recall_prev) * precision)
+  }
+  
+  # ---- helper: calibration intercept & slope ------------------------------
+  calibration_stats <- function(y_true, p_hat) {
+    eps <- 1e-6
+    p_clipped <- pmin(pmax(p_hat, eps), 1 - eps)
+    logit_p <- qlogis(p_clipped)
+    cal_fit <- glm(y_true ~ logit_p, family = binomial())
+    coefs <- coef(cal_fit)
+    list(
+      intercept = unname(coefs[1]),
+      slope     = unname(coefs["logit_p"])
+    )
+  }
+  
+  #-------------------------------
+  # 1. Train/test split
+  #-------------------------------
+  set.seed(seed)
+  n <- nrow(data)
+  train_size <- floor(train_frac * n)
+  train_index <- sample(seq_len(n), size = train_size)
+  
+  train <- data[train_index, , drop = FALSE]
+  test  <- data[-train_index, , drop = FALSE]
+  
+  #-------------------------------
+  # 2. Standardization (training-based)
+  #-------------------------------
+  scale_list <- lapply(train[, predictors, drop = FALSE],
+                       function(x) c(mean = mean(x), sd = sd(x)))
+  scale_values <- do.call(rbind, scale_list)
+  
+  standardize_df <- function(df) {
+    out <- df
+    for (p in predictors) {
+      m <- scale_values[p, "mean"]
+      s <- scale_values[p, "sd"]
+      out[[p]] <- (out[[p]] - m) / s
+    }
+    out
+  }
+  
+  train_std <- standardize_df(train)
+  test_std  <- standardize_df(test)
+  
+  #-------------------------------
+  # 3. Model matrices
+  #-------------------------------
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  X_train <- model.matrix(formula_obj, data = train_std)[, -1, drop = FALSE]
+  y_train <- train_std[[response]]
+  
+  X_test  <- model.matrix(formula_obj, data = test_std)[, -1, drop = FALSE]
+  y_test  <- test_std[[response]]
+  
+  N <- nrow(X_train)
+  K <- ncol(X_train)
+  
+  stan_data <- list(
+    N = N,
+    K = K,
+    X = X_train,
+    y = y_train,
+    sigma_beta = sigma_beta,
+    sigma_alpha = sigma_alpha
+  )
+  
+  #-------------------------------
+  # 4. Compile Stan model (once per session)
+  #-------------------------------
+  if (is.null(compiled_model)) {
+    sm <- rstan::stan_model(model_code = stan_code)
+  } else {
+    sm <- compiled_model
+  }
+  
+  #-------------------------------
+  # 5. Sample from posterior
+  #-------------------------------
+  fit <- rstan::sampling(
+    sm,
+    data = stan_data,
+    iter = iter,
+    chains = chains,
+    seed = seed,
+    refresh = 0
+  )
+  
+  #-------------------------------
+  # 6. Posterior summaries (alpha, beta)
+  #-------------------------------
+  summ <- rstan::summary(fit, pars = c("alpha", "beta"))$summary
+  alpha_mean <- summ["alpha", "mean"]
+  beta_means <- summ[grep("^beta\\[", rownames(summ)), "mean"]
+  names(beta_means) <- colnames(X_train)
+  
+  #-------------------------------
+  # 7. Test-set predictions (using posterior means)
+  #-------------------------------
+  linpred_test <- as.vector(alpha_mean + X_test %*% beta_means)
+  prob_test <- plogis(linpred_test)
+  class_test <- ifelse(prob_test >= 0.5, 1L, 0L)
+  
+  #-------------------------------
+  # 8. Point-estimate performance metrics
+  #-------------------------------
+  roc_obj <- roc(response = y_test, predictor = prob_test)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  accuracy <- mean(class_test == y_test)
+  brier <- mean((prob_test - y_test)^2)
+  pr_auc_val <- pr_auc_ap(y_test, prob_test)
+  cal <- calibration_stats(y_test, prob_test)
+  
+  #-------------------------------
+  # 9. Bootstrap CIs (optional)
+  #-------------------------------
+  AUC_CI <- PR_AUC_CI <- ACC_CI <- Brier_CI <- 
+    calib_int_CI <- calib_slope_CI <- c(NA_real_, NA_real_)
+  
+  if (boot) {
+    n_test <- length(y_test)
+    AUC_boot   <- numeric(n_boot)
+    PR_boot    <- numeric(n_boot)
+    ACC_boot   <- numeric(n_boot)
+    Brier_boot <- numeric(n_boot)
+    INT_boot   <- numeric(n_boot)
+    SLOPE_boot <- numeric(n_boot)
+    
+    for (b in seq_len(n_boot)) {
+      idx <- sample.int(n_test, n_test, replace = TRUE)
+      y_b <- y_test[idx]
+      p_b <- prob_test[idx]
+      c_b <- ifelse(p_b >= 0.5, 1L, 0L)
+      
+      # AUC
+      if (length(unique(y_b)) == 2) {
+        AUC_boot[b] <- tryCatch(
+          as.numeric(auc(roc(response = y_b, predictor = p_b))),
+          error = function(e) NA_real_
+        )
+      } else {
+        AUC_boot[b] <- NA_real_
+      }
+      
+      # PR-AUC
+      PR_boot[b] <- pr_auc_ap(y_b, p_b)
+      
+      # Accuracy
+      ACC_boot[b] <- mean(c_b == y_b)
+      
+      # Brier
+      Brier_boot[b] <- mean((p_b - y_b)^2)
+      
+      # Calibration
+      cal_b <- tryCatch(
+        calibration_stats(y_b, p_b),
+        error = function(e) list(intercept = NA_real_, slope = NA_real_)
+      )
+      INT_boot[b]   <- cal_b$intercept
+      SLOPE_boot[b] <- cal_b$slope
+    }
+    
+    qfun <- function(x) quantile(x[is.finite(x) & !is.na(x)], probs = c(0.025, 0.975))
+    
+    if (any(is.finite(AUC_boot)))       AUC_CI         <- qfun(AUC_boot)
+    if (any(is.finite(PR_boot)))        PR_AUC_CI      <- qfun(PR_boot)
+    if (any(is.finite(ACC_boot)))       ACC_CI         <- qfun(ACC_boot)
+    if (any(is.finite(Brier_boot)))     Brier_CI       <- qfun(Brier_boot)
+    if (any(is.finite(INT_boot)))       calib_int_CI   <- qfun(INT_boot)
+    if (any(is.finite(SLOPE_boot)))     calib_slope_CI <- qfun(SLOPE_boot)
+  }
+  
+  #-------------------------------
+  # 10. Return everything
+  #-------------------------------
+  list(
+    call = match.call(),
+    formula = formula_obj,
+    predictors = predictors,
+    stan_fit = fit,
+    scale_values = scale_values,
+    posterior_summary = summ,
+    coef_means = list(
+      alpha = alpha_mean,
+      beta = beta_means
+    ),
+    predictions = data.frame(
+      row_id = rownames(test),
+      observed = y_test,
+      predicted_prob = prob_test,
+      predicted_class = class_test
+    ),
+    performance = list(
+      AUC = auc_val,
+      AUC_CI = AUC_CI,
+      PR_AUC = pr_auc_val,
+      PR_AUC_CI = PR_AUC_CI,
+      accuracy = accuracy,
+      accuracy_CI = ACC_CI,
+      Brier = brier,
+      Brier_CI = Brier_CI,
+      calib_intercept = cal$intercept,
+      calib_intercept_CI = calib_int_CI,
+      calib_slope = cal$slope,
+      calib_slope_CI = calib_slope_CI
+    ),
+    train_index = train_index,
+    compiled_model = sm
+  )
+}
+
+```
+
+Function to check if model is saved
+```{r}
+run_or_load_model <- function(path, fit_expr, verbose = TRUE) {
+  # path: where to save the fitted model (.rds)
+  # fit_expr: expression that returns the fitted object (e.g., your fit_bayes_logit_ridge call)
+  
+  if (file.exists(path)) {
+    if (verbose) message("Loading saved model from: ", path)
+    fit <- readRDS(path)
+  } else {
+    if (verbose) message("Fitting model (cache not found): ", path)
+    fit <- eval.parent(substitute(fit_expr))
+    
+    # Ensure directory exists
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    
+    if (verbose) message("Saving fitted model to: ", path)
+    saveRDS(fit, path)
+  }
+  
+  fit
+}
+```
+
+```{r}
+predictors_m1.1 <- c("temperature", "precipitation", "wind", "relative_humidity")#, 
+                   #"FFMC", "DMC", "DC", 
+                   #"C", "B", "U")
+model_path <- file.path(rds_root, "ignition_efficiency_bayes_models/m1.1_bayes_2001_2012_climate.rds")
+
+m1.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              
+  predictors = predictors_m1.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+
+ggplot() + geom_point(data=m1.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m1.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m2.1 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   "FFMC", "DMC", "DC")#, 
+                   #"C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m2.1_bayes_2001_2012_climate.rds")
+
+m2.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m2.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m2.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m2.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m3.1 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   #"FFMC", "DMC", "DC")#, 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m3.1_bayes_2001_2012_climate.rds")
+
+m3.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m3.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m3.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m3.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m4.1 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC")#, 
+                   #"C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m4.1_bayes_2001_2012_climate.rds")
+
+m4.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m4.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m4.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m4.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m5.1 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   #"FFMC", "DMC", "DC")#, 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m5.1_bayes_2001_2012_climate.rds")
+
+m5.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m5.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m5.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m5.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m6.1 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m6.1_bayes_2001_2012_climate.rds")
+
+m6.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m6.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m6.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m6.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m7.1 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m7.1_bayes_2001_2012_climate.rds")
+
+m7.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m7.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m7.1$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m7.1 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+```
+
+```{r}
+model <- c("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+training_years <- rep("2001-2012", 7)
+approach <- rep("Bayesian", 7)
+predictors <- c("climate", "fuel moisture", "vegetation", "climate & fuel moisture", "climate & vegetation", "fuel moisture & vegetation", "climate, fuel moisture & vegetation")
+
+AUC <- c(m1.1$performance$AUC, m2.1$performance$AUC, m3.1$performance$AUC, m4.1$performance$AUC, m5.1$performance$AUC, m6.1$performance$AUC, m7.1$performance$AUC)
+
+PR_AUC <- c(m1.1$performance$PR_AUC, m2.1$performance$PR_AUC, m3.1$performance$PR_AUC, m4.1$performance$PR_AUC, m5.1$performance$PR_AUC, m6.1$performance$PR_AUC, m7.1$performance$PR_AUC)
+
+accuracy <- c(m1.1$performance$accuracy, m2.1$performance$accuracy, m3.1$performance$accuracy, m4.1$performance$accuracy, m5.1$performance$accuracy, m6.1$performance$accuracy, m7.1$performance$accuracy)
+
+Brier <- c(m1.1$performance$Brier, m2.1$performance$Brier, m3.1$performance$Brier, m4.1$performance$Brier, m5.1$performance$Brier, m6.1$performance$Brier, m7.1$performance$Brier)
+
+calib_intercept <- c(m1.1$performance$calib_intercept, m2.1$performance$calib_intercept, m3.1$performance$calib_intercept, m4.1$performance$calib_intercept, m5.1$performance$calib_intercept, m6.1$performance$calib_intercept, m7.1$performance$calib_intercept)
+
+calib_slope <- c(m1.1$performance$calib_slope, m2.1$performance$calib_slope, m3.1$performance$calib_slope, m4.1$performance$calib_slope, m5.1$performance$calib_slope, m6.1$performance$calib_slope, m7.1$performance$calib_slope)
+
+#confidence intervals
+AUC_CI_low <- c(m1.1$performance$AUC_CI[1], m2.1$performance$AUC_CI[1], m3.1$performance$AUC_CI[1], m4.1$performance$AUC_CI[1], m5.1$performance$AUC_CI[1], m6.1$performance$AUC_CI[1], m7.1$performance$AUC_CI[1])
+AUC_CI_high <- c(m1.1$performance$AUC_CI[2], m2.1$performance$AUC_CI[2], m3.1$performance$AUC_CI[2], m4.1$performance$AUC_CI[2], m5.1$performance$AUC_CI[2], m6.1$performance$AUC_CI[2], m7.1$performance$AUC_CI[2])
+
+PR_AUC_CI_low <- c(m1.1$performance$PR_AUC_CI[1], m2.1$performance$PR_AUC_CI[1], m3.1$performance$PR_AUC_CI[1], m4.1$performance$PR_AUC_CI[1], m5.1$performance$PR_AUC_CI[1], m6.1$performance$PR_AUC_CI[1], m7.1$performance$PR_AUC_CI[1])
+PR_AUC_CI_high <- c(m1.1$performance$PR_AUC_CI[2], m2.1$performance$PR_AUC_CI[2], m3.1$performance$PR_AUC_CI[2], m4.1$performance$PR_AUC_CI[2], m5.1$performance$PR_AUC_CI[2], m6.1$performance$PR_AUC_CI[2], m7.1$performance$PR_AUC_CI[2])
+
+Brier_CI_low <- c(m1.1$performance$Brier_CI[1], m2.1$performance$Brier_CI[1], m3.1$performance$Brier_CI[1], m4.1$performance$Brier_CI[1], m5.1$performance$Brier_CI[1], m6.1$performance$Brier_CI[1], m7.1$performance$Brier_CI[1])
+Brier_CI_high <- c(m1.1$performance$Brier_CI[2], m2.1$performance$Brier_CI[2], m3.1$performance$Brier_CI[2], m4.1$performance$Brier_CI[2], m5.1$performance$Brier_CI[2], m6.1$performance$Brier_CI[2], m7.1$performance$Brier_CI[2])
+
+calib_intercept_CI_low <- c(m1.1$performance$calib_intercept_CI[1], m2.1$performance$calib_intercept_CI[1], m3.1$performance$calib_intercept_CI[1], m4.1$performance$calib_intercept_CI[1], m5.1$performance$calib_intercept_CI[1], m6.1$performance$calib_intercept_CI[1], m7.1$performance$calib_intercept_CI[1])
+calib_intercept_CI_high <- c(m1.1$performance$calib_intercept_CI[2], m2.1$performance$calib_intercept_CI[2], m3.1$performance$calib_intercept_CI[2], m4.1$performance$calib_intercept_CI[2], m5.1$performance$calib_intercept_CI[2], m6.1$performance$calib_intercept_CI[2], m7.1$performance$calib_intercept_CI[2])
+
+calib_slope_CI_low <- c(m1.1$performance$calib_slope_CI[1], m2.1$performance$calib_slope_CI[1], m3.1$performance$calib_slope_CI[1], m4.1$performance$calib_slope_CI[1], m5.1$performance$calib_slope_CI[1], m6.1$performance$calib_slope_CI[1], m7.1$performance$calib_slope_CI[1])
+calib_slope_CI_high <- c(m1.1$performance$calib_slope_CI[2], m2.1$performance$calib_slope_CI[2], m3.1$performance$calib_slope_CI[2], m4.1$performance$calib_slope_CI[2], m5.1$performance$calib_slope_CI[2], m6.1$performance$calib_slope_CI[2], m7.1$performance$calib_slope_CI[2])
+
+df_performance_3 <- as.data.frame(cbind(model, training_years, approach, predictors, AUC, PR_AUC, accuracy, Brier, calib_intercept, calib_slope, AUC_CI_low, AUC_CI_high, PR_AUC_CI_low, PR_AUC_CI_high, Brier_CI_low, Brier_CI_high, calib_intercept_CI_low, calib_intercept_CI_high, calib_slope_CI_low, calib_slope_CI_high))
+
+p1 <- ggplot(data=df_performance_3, aes(y=AUC, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p2 <- ggplot(data=df_performance_3, aes(y=accuracy, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Accuracy")
+
+p3 <- ggplot(data=df_performance_3, aes(y=Brier, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Brier")
+
+p1 + p2 + p3
+```
+
+
+#----------------------------
+## Data for 2012 - 2018
+#----------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2012_2018_10x.csv")
+df <- read.csv(drivers_file_path)
+
+df <- na.omit(df) 
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+```{r}
+predictors_m1.2 <- c("temperature", "precipitation", "wind", "relative_humidity")#, 
+                   #"FFMC", "DMC", "DC", 
+                   #"C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m1.2_bayes_2012_2018_climate.rds")
+
+m1.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m1.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m1.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m1.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m2.2 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   "FFMC", "DMC", "DC")#, 
+                   #"C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m2.2_bayes_2012_2018_climate.rds")
+
+m2.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m2.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m2.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m2.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m3.2 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   #"FFMC", "DMC", "DC")#, 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m3.2_bayes_2012_2018_climate.rds")
+
+m3.2 <- run_or_load_model(
+  path = model_path,fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m3.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m3.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m3.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m4.2 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC")#, 
+                   #"C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m4.2_bayes_2012_2018_climate.rds")
+
+m4.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m4.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m4.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m4.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m5.2 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   #"FFMC", "DMC", "DC")#, 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m5.2_bayes_2012_2018_climate.rds")
+
+m5.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m5.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m5.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m5.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m6.2 <- c(#"temperature", "precipitation", "wind", "relative_humidity")#, 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m6.2_bayes_2012_2018_climate.rds")
+
+m6.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m6.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m6.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m6.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+
+#################
+
+predictors_m7.2 <- c("temperature", "precipitation", "wind", "relative_humidity", 
+                   "FFMC", "DMC", "DC", 
+                   "C", "B", "U")
+model_path <- file.path(rds_rood, "ignition_efficiency_bayes_models/m7.2_bayes_2012_2018_climate.rds")
+
+m7.2 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              # e.g., your 2012–2018 Alaska subset
+  predictors = predictors_m7.2,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+ggplot() + geom_point(data=m7.2$predictions, aes(x=as.factor(observed), y=predicted_prob, color=as.factor(predicted_class))) +
+  ggtitle("m7.2 Observed vs. Predicted (bayes approach)") +
+  xlab("Observed") + ylab("Predicted Probability") +
+  labs(color = "Predicted Class") +
+  ylim(0,1)
+```
+
+```{r}
+model <- c("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+training_years <- rep("2012-2018", 7)
+approach <- rep("Bayesian", 7)
+predictors <- c("climate", "fuel moisture", "vegetation", "climate & fuel moisture", "climate & vegetation", "fuel moisture & vegetation", "climate, fuel moisture & vegetation")
+
+AUC <- c(m1.2$performance$AUC, m2.2$performance$AUC, m3.2$performance$AUC, m4.2$performance$AUC, m5.2$performance$AUC, m6.2$performance$AUC, m7.2$performance$AUC)
+
+PR_AUC <- c(m1.2$performance$PR_AUC, m2.2$performance$PR_AUC, m3.2$performance$PR_AUC, m4.2$performance$PR_AUC, m5.2$performance$PR_AUC, m6.2$performance$PR_AUC, m7.2$performance$PR_AUC)
+
+accuracy <- c(m1.2$performance$accuracy, m2.2$performance$accuracy, m3.2$performance$accuracy, m4.2$performance$accuracy, m5.2$performance$accuracy, m6.2$performance$accuracy, m7.2$performance$accuracy)
+
+Brier <- c(m1.2$performance$Brier, m2.2$performance$Brier, m3.2$performance$Brier, m4.2$performance$Brier, m5.2$performance$Brier, m6.2$performance$Brier, m7.2$performance$Brier)
+
+calib_intercept <- c(m1.2$performance$calib_intercept, m2.2$performance$calib_intercept, m3.2$performance$calib_intercept, m4.2$performance$calib_intercept, m5.2$performance$calib_intercept, m6.2$performance$calib_intercept, m7.2$performance$calib_intercept)
+
+calib_slope <- c(m1.2$performance$calib_slope, m2.2$performance$calib_slope, m3.2$performance$calib_slope, m4.2$performance$calib_slope, m5.2$performance$calib_slope, m6.2$performance$calib_slope, m7.2$performance$calib_slope)
+
+#confidence intervals
+AUC_CI_low <- c(m1.2$performance$AUC_CI[1], m2.2$performance$AUC_CI[1], m3.2$performance$AUC_CI[1], m4.2$performance$AUC_CI[1], m5.2$performance$AUC_CI[1], m6.2$performance$AUC_CI[1], m7.2$performance$AUC_CI[1])
+AUC_CI_high <- c(m1.2$performance$AUC_CI[2], m2.2$performance$AUC_CI[2], m3.2$performance$AUC_CI[2], m4.2$performance$AUC_CI[2], m5.2$performance$AUC_CI[2], m6.2$performance$AUC_CI[2], m7.2$performance$AUC_CI[2])
+
+PR_AUC_CI_low <- c(m1.2$performance$PR_AUC_CI[1], m2.2$performance$PR_AUC_CI[1], m3.2$performance$PR_AUC_CI[1], m4.2$performance$PR_AUC_CI[1], m5.2$performance$PR_AUC_CI[1], m6.2$performance$PR_AUC_CI[1], m7.2$performance$PR_AUC_CI[1])
+PR_AUC_CI_high <- c(m1.2$performance$PR_AUC_CI[2], m2.2$performance$PR_AUC_CI[2], m3.2$performance$PR_AUC_CI[2], m4.2$performance$PR_AUC_CI[2], m5.2$performance$PR_AUC_CI[2], m6.2$performance$PR_AUC_CI[2], m7.2$performance$PR_AUC_CI[2])
+
+Brier_CI_low <- c(m1.2$performance$Brier_CI[1], m2.2$performance$Brier_CI[1], m3.2$performance$Brier_CI[1], m4.2$performance$Brier_CI[1], m5.2$performance$Brier_CI[1], m6.2$performance$Brier_CI[1], m7.2$performance$Brier_CI[1])
+Brier_CI_high <- c(m1.2$performance$Brier_CI[2], m2.2$performance$Brier_CI[2], m3.2$performance$Brier_CI[2], m4.2$performance$Brier_CI[2], m5.2$performance$Brier_CI[2], m6.2$performance$Brier_CI[2], m7.2$performance$Brier_CI[2])
+
+calib_intercept_CI_low <- c(m1.2$performance$calib_intercept_CI[1], m2.2$performance$calib_intercept_CI[1], m3.2$performance$calib_intercept_CI[1], m4.2$performance$calib_intercept_CI[1], m5.2$performance$calib_intercept_CI[1], m6.2$performance$calib_intercept_CI[1], m7.2$performance$calib_intercept_CI[1])
+calib_intercept_CI_high <- c(m1.2$performance$calib_intercept_CI[2], m2.2$performance$calib_intercept_CI[2], m3.2$performance$calib_intercept_CI[2], m4.2$performance$calib_intercept_CI[2], m5.2$performance$calib_intercept_CI[2], m6.2$performance$calib_intercept_CI[2], m7.2$performance$calib_intercept_CI[2])
+
+calib_slope_CI_low <- c(m1.2$performance$calib_slope_CI[1], m2.2$performance$calib_slope_CI[1], m3.2$performance$calib_slope_CI[1], m4.2$performance$calib_slope_CI[1], m5.2$performance$calib_slope_CI[1], m6.2$performance$calib_slope_CI[1], m7.2$performance$calib_slope_CI[1])
+calib_slope_CI_high <- c(m1.2$performance$calib_slope_CI[2], m2.2$performance$calib_slope_CI[2], m3.2$performance$calib_slope_CI[2], m4.2$performance$calib_slope_CI[2], m5.2$performance$calib_slope_CI[2], m6.2$performance$calib_slope_CI[2], m7.2$performance$calib_slope_CI[2])
+
+df_performance_4 <- as.data.frame(cbind(model, training_years, approach, predictors, AUC, PR_AUC, accuracy, Brier, calib_intercept, calib_slope, AUC_CI_low, AUC_CI_high, PR_AUC_CI_low, PR_AUC_CI_high, Brier_CI_low, Brier_CI_high,  calib_intercept_CI_low, calib_intercept_CI_high, calib_slope_CI_low, calib_slope_CI_high))
+
+p1 <- ggplot(data=df_performance_4, aes(y=AUC, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Area Under the Curve (AUC)")
+
+p2 <- ggplot(data=df_performance_4, aes(y=accuracy, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Accuracy")
+
+p3 <- ggplot(data=df_performance_4, aes(y=Brier, x=model, fill=predictors)) + geom_bar(stat="identity", position=position_dodge()) + ggtitle("Brier")
+
+p1 + p2 + p3
+```
+
+
+```{r}
+performance_df <- as.data.frame(rbind(df_performance_1, df_performance_2, df_performance_3, df_performance_4))
+performance_df$AUC <- as.numeric(performance_df$AUC)
+performance_df$PR_AUC <- as.numeric(performance_df$PR_AUC)
+performance_df$Brier <- as.numeric(performance_df$Brier)
+performance_df$calib_intercept <- as.numeric(performance_df$calib_intercept)
+performance_df$calib_slope <- as.numeric(performance_df$calib_slope)
+
+performance_df$AUC_CI_low <- as.numeric(performance_df$AUC_CI_low)
+performance_df$AUC_CI_high <- as.numeric(performance_df$AUC_CI_high)
+performance_df$PR_AUC_CI_low <- as.numeric(performance_df$PR_AUC_CI_low)
+performance_df$PR_AUC_CI_high <- as.numeric(performance_df$PR_AUC_CI_high)
+performance_df$Brier_CI_low <- as.numeric(performance_df$Brier_CI_low)
+performance_df$Brier_CI_high <- as.numeric(performance_df$Brier_CI_high)
+performance_df$calib_intercept_CI_low <- as.numeric(performance_df$calib_intercept_CI_low)
+performance_df$calib_intercept_CI_high <- as.numeric(performance_df$calib_intercept_CI_high)
+performance_df$calib_slope_CI_low <- as.numeric(performance_df$calib_slope_CI_low)
+performance_df$calib_slope_CI_high <- as.numeric(performance_df$calib_slope_CI_high)
+
+table_file_path <- file.path(table_root, "ignition_efficiency_model_performance.csv")
+write.csv(performance_df, table_file_path)
+```
+

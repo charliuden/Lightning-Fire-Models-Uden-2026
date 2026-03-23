@@ -1,0 +1,215 @@
+---
+title: "Figure_5"
+author: "Charlotte Uden"
+date: "2026-01-30"
+output: html_document
+---
+
+Figure 5. Interannual variability of observed fire frequency and simulated fire probability in Alaska, 2002-2011. Yellow circles show annual mean observed fire rate (number of fire days/total number of days) with error bars representing 95% binomial confidence intervals around the annual mean fire occurrence. Blue triangles show annual mean predicted fire probability with error bars representing bootstrap 95% confidence interval of the annual mean, via resampling cells with replacement. The dotted horizontal line marks the ten-year observed mean lightning-caused fire rate (0.00067) and provides a reference for interannual anomalies. 
+
+
+```{r}
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths 
+```
+
+```{r}
+df <- read.csv(file.path(predictions_root, "drivers_predictions_and_observations_2001-2012_10x.csv"))
+```
+
+#Bars for observed fire rate:
+
+Use a binomial standard error / confidence interval instead of standard deviation. For each year, compute:
+mu = mean(fire)
+SE = sqrt(mu*(1-mu)/n)
+error bar = mu +- 1.96*SE
+This gives uncertainty on the mean rate, not spread among daily 0/1 values. 
+
+```{r}
+
+summary_df <- df %>%
+  group_by(year) %>%
+  summarise(
+    mean_fire   = mean(fire, na.rm = TRUE),
+    n           = sum(is.finite(fire)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se_fire = sqrt(mean_fire * (1 - mean_fire) / n),
+    lo_fire = pmax(0, mean_fire - 1.96 * se_fire),
+    hi_fire = pmin(1, mean_fire + 1.96 * se_fire),
+  )
+
+
+
+```
+
+#Bars for predicted fire probability:
+
+Bootstrap uncertainty of the annual mean predicted probability of fire. For each year, mean_pred = mean (P_fire) over all gridcell-days
+lo, high = bootsrap 95% CI of the annual mean, via resampling cells with replacement
+
+```{r}
+bootstrap_annual_mean_pred <- function(df, p_col = "P_fire", year_col = "year",
+                                       cluster_col = "cell_id",
+                                       B = 1000, conf = 0.95, seed = 1) {
+  stopifnot(all(c(p_col, year_col, cluster_col) %in% names(df)))
+
+  # Keep only needed columns, drop NAs
+  d <- df[, c(year_col, cluster_col, p_col)]
+  d <- d[is.finite(d[[p_col]]) & is.finite(d[[year_col]]), , drop = FALSE]
+
+  # Use data.table for speed/memory
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table for this function: install.packages('data.table')")
+  }
+  dt <- data.table::as.data.table(d)
+  data.table::setnames(dt, c(year_col, cluster_col, p_col), c("year", "cluster", "p"))
+
+  # Precompute row indices for each (year, cluster)
+  idx_by_cluster <- dt[, .(idx = list(.I)), by = .(year, cluster)]
+
+  # For each year, store: unique clusters + list of indices per cluster
+  years <- sort(unique(idx_by_cluster$year))
+  alpha <- (1 - conf) / 2
+
+  set.seed(seed)
+
+  out <- lapply(years, function(yy) {
+    sub <- idx_by_cluster[year == yy]
+    clusters <- sub$cluster
+    idx_list <- sub$idx
+    K <- length(clusters)
+
+    # Point estimate (no resampling)
+    mean_pred <- mean(dt[year == yy, p])
+
+    # Bootstrap
+    boot_means <- numeric(B)
+    for (b in seq_len(B)) {
+      # resample clusters with replacement
+      samp <- sample.int(K, size = K, replace = TRUE)
+
+      # concatenate row indices for sampled clusters
+      idx <- unlist(idx_list[samp], use.names = FALSE)
+
+      boot_means[b] <- mean(dt$p[idx])
+    }
+
+    qs <- stats::quantile(boot_means, probs = c(alpha, 1 - alpha), names = FALSE, type = 7)
+
+    data.frame(
+      year = yy,
+      mean_pred = mean_pred,
+      lo_pred = qs[1],
+      hi_pred = qs[2]
+    )
+  })
+
+  out <- do.call(rbind, out)
+  out
+}
+
+pred_ci <- bootstrap_annual_mean_pred(df, p_col = "i.P_fire", cluster_col = "cell_id",
+                                      B = 1000, seed = 123)
+
+head(pred_ci)
+```
+
+#merge and convert to long format
+```{r}
+summary_df <- merge(summary_df, pred_ci, by="year")
+
+summary_long <- summary_df %>%
+  transmute(
+    year,
+    series = "Observed fire rate",
+    mean   = mean_fire,
+    lo     = lo_fire,
+    hi     = hi_fire
+  ) %>%
+  bind_rows(
+    summary_df %>%
+      transmute(
+        year,
+        series = "Predicted fire probability",
+        mean   = mean_pred,
+        lo     = lo_pred,
+        hi     = hi_pred
+      )
+  )
+```
+
+
+```{r}
+pd <- position_dodge(width = 0.4)
+
+custom_grid_lines_x <- c(2002.5, 2003.5, 2004.5, 2005.5, 2006.5, 2007.5, 2008.5, 2009.5, 2010.5, 2011.5) 
+
+p <- ggplot(summary_long,
+            aes(x = year, y = mean, color = series, shape = series)) +
+  
+  geom_point(size = 3, position = pd) +
+  
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                width = 0.2, position = pd) +
+  
+  scale_color_manual(values = c("Observed fire rate" = "#FFC20A", "Predicted fire probability" = "#0C7BDC"),
+                     labels = c("Observed fire rate", "Predicted fire probability")) +
+  
+  geom_hline(yintercept = sum(df$fire)/nrow(df), linetype = "dotted", color = "black", linewidth = 0.5) +
+  
+  scale_x_continuous(breaks = summary_df$year) +
+  
+  theme_bw() +
+   geom_vline(xintercept = custom_grid_lines_x, color = "gray", linewidth = 0.1) +
+
+  theme(
+    panel.grid.major.x = element_blank(), # Remove default major vertical gridlines
+    panel.grid.minor.x = element_blank(), # Remove default minor vertical gridlines
+    panel.grid.major.y = element_line(color = "gray", linewidth = 0.1), # Keep/style horizontal gridlines
+    panel.grid.minor.y = element_blank()  # Remove minor horizontal gridlines if desired
+  ) +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  labs(x = "Year", y = "Fire probability / rate") +
+  
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.0001))
+
+p
+```
+
+
+```{r}
+ggsave(file.path(figure_root, "Figure_5.png"), plot = p, width = 8, height = 3, dpi = 1100, units = "in")
+```
+
+
+

@@ -1,0 +1,181 @@
+---
+title: "Random Forest"
+author: "Charlotte Uden"
+date: "2025-08-29"
+output: html_document
+---
+
+```{r}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+```
+
+---------------------------------------------------
+Run random forest for 2002-2011 ignition efficiency
+---------------------------------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+df <- na.omit(df) 
+
+df <- df %>%
+  drop_na()
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+
+```{r}
+df <- df[c("caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+
+#check for correlation between variables
+#draw random sample of rows to plot 
+plot(df)
+
+#apply random forest:
+rf <-randomForest(caused_fire~.,data=df, ntree=500) 
+print(rf)
+
+#mtry: Number of random variables used in each tree
+# - reducing mtry reduces correlation and strength. 
+# - the oob error rate tells you what value of mtry is optimal
+
+mtry <- tuneRF(df[-1],df$caused_fire, ntreeTry=500,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+#looking for mtry for the lowest oob error rate 
+print(mtry)
+print(best.m) 
+
+#apply best mtry to model
+rf <-randomForest(caused_fire~.,data=df, mtry=best.m, importance=TRUE,ntree=500)
+print(rf)
+
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+
+
+```
+# Mean Decrease Accuracy (%IncMSE):
+- remove variables from the model and asses which have the greatest impact on model accuracy.
+- Higher the value of mean decrease accuracy or mean decrease gini score ,
+       higher the importance of the variable in the model.
+- tells you effect of randomly shuffling values of a variable on increasing mse of model predictions
+- a higher number indicates that the variable is more important
+
+# Mean Decrease Gini or Increase in Node Purity (IncNodePurity):
+- expresses the change in the homogeneity of the of the groups created by the trees
+     (using the Gini coefficient as a measure).
+- What is expressed is the decrease in said purity if a particular variable
+      has no information. If a variable has no information to begin with,
+      the decrase would be zero. (from: https://www.reagro.org/methods/statistical/randomforest.html)
+
+Save random forest results forAppendix
+```{r}
+rf_results <- importance(rf)
+rf_results <- data.frame(Variable = rownames(rf_results), 
+                     IncMSE = rf_results[, "%IncMSE"],
+                     IncNodePurity = rf_results[, "IncNodePurity"]) 
+# Export
+table_file_path <- file.path(table_root, "lightning_random_forest_results_2002_2011.csv")
+write.csv(rf_results, table_file_path, row.names = FALSE)
+```
+
+
+---------------------------------------------------
+Run random forest for 2012-2018 ignition efficiency
+---------------------------------------------------
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2012_2018_10x.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+df <- na.omit(df) 
+
+df <- df %>%
+  drop_na()
+
+#note that lat.1 and lon.1, and date.1 are the locations and date of the era5 grid points. 
+df$date <- as.POSIXct(df$date, format = "%Y-%m-%d")
+df <- df[ , c("lat","lon","date","caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+str(df)
+```
+
+
+```{r}
+df <- df[c("caused_fire","temperature","precipitation","wind","relative_humidity","FFMC","DMC","DC", "C", "B", "U")]
+
+#check for correlation between variables
+#draw random sample of rows to plot 
+plot(df)
+
+#apply random forest:
+rf <-randomForest(caused_fire~.,data=df, ntree=500) 
+print(rf)
+
+#mtry: Number of random variables used in each tree
+# - reducing mtry reduces correlation and strength. 
+# - the oob error rate tells you what value of mtry is optimal
+
+mtry <- tuneRF(df[-1],df$caused_fire, ntreeTry=500,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+#looking for mtry for the lowest oob error rate 
+print(mtry)
+print(best.m) 
+
+#apply best mtry to model
+rf <-randomForest(caused_fire~.,data=df, mtry=best.m, importance=TRUE,ntree=500)
+print(rf)
+
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+
+
+```
+
+Save random forest results for Appendix  
+```{r}
+rf_results <- importance(rf)
+rf_results <- data.frame(Variable = rownames(rf_results), 
+                     IncMSE = rf_results[, "%IncMSE"],
+                     IncNodePurity = rf_results[, "IncNodePurity"]) 
+# Export
+table_file_path <- file.path(table_root, "lightning_random_forest_results_2012_2018.csv")
+write.csv(rf_results, table_file_path, row.names = FALSE)
+```
+
+
+
+

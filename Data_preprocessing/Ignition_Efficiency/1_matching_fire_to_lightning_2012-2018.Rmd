@@ -1,0 +1,611 @@
+---
+title: "Matching_Fire_to_Lightning"
+author: "Charlotte Uden"
+date: "2026-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(terra)
+library(sf)
+library(lubridate)
+library(MASS)
+library(fields)
+library(lubridate)
+library(geosphere)
+library(ggspatial)
+library(viridis)
+library(rlang) 
+library(purrr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths (ie line 52)
+```
+
+#####################
+2012-2018
+#####################
+
+Lightning data are downloaded from:
+https://fire.ak.blm.gov/predsvcs/maps.php
+```{r}
+file_path <- file.path(data_root, "Historical_Lightning_2012_2024_TOA_WGS84.txt")
+df <- read.csv(file_path)
+
+#colnames(df) <- df[1,] #apply column names, which are in the first row
+#df <- df[-1,] #remove first row
+
+df <- df %>% filter(
+    STROKETYPE=="GROUND_STROKE") #only need cloud to ground strikes
+df <- df[c("UTCDATETIME", "LATITUDE", "LONGITUDE")] #only need time and location of each strike
+df$UTCDATETIME <- as.POSIXct(df$UTCDATETIME, format = "%m/%d/%Y %H:%M:%S", tx="UTC")
+df$LATITUDE <- as.numeric(df$LATITUDE)
+df$LONGITUDE <- as.numeric(df$LONGITUDE)
+str(df)
+```
+
+Hessilt et al. (2024) only use June through August. (lightning activity high, vegetation is dry enough to burn, and fire weather conditions are at their peak)
+```{r}
+nrow(df)
+df$month <- as.integer(format(df$UTCDATETIME, "%m"))
+df <- filter(df, month %in% c(6, 7, 8))
+nrow(df)
+```
+
+Alaska polygon shapefile for mapping
+```{r}
+library(rnaturalearth)
+library(rnaturalearthdata)
+
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+```
+
+```{r}
+#-------------
+#plot lightning in june/july/august 2012 over a map of alaska:
+#-------------
+# Step 1: Filter data (customize for your region/year)
+df$year <- as.integer(format(df$UTCDATETIME, "%Y"))
+
+df_2012 <- df %>%
+  filter(year == 2012) 
+
+points_sf <- st_as_sf(df_2012, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(data = points_sf, color = "blue", size = 2, alpha=0.01) +
+  coord_sf(xlim = c(-180, -30), ylim = c(47, 80)) +
+  theme_minimal() +
+  labs(title = "Lightning Points in 2012",
+       x = "Longitude", y = "Latitude")
+
+#-------------
+#plot the density of lightning in june/july/august 2012 
+#-------------
+
+#Filter data (customize for your region/year)
+df$year <- as.integer(format(df$UTCDATETIME, "%Y"))
+
+df_2012 <- df %>%
+  filter(year == 2012) 
+
+#Compute 2D kernel density surface
+dens <- with(df_2012, kde2d(LONGITUDE, LATITUDE, n = 200))
+
+#Interpolate density at each point
+df_2012$density <- with(df_2012,
+                        interp.surface(list(x = dens$x, y = dens$y, z = dens$z),
+                                       cbind(LONGITUDE, LATITUDE)))
+
+# Optional: remove very low density points
+df_filtered <- df_2012 %>% filter(density > 1e-6)
+
+points_sf <- st_as_sf(df_filtered, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+
+ggplot() + 
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(data = points_sf, aes(color = density), alpha=0.01, size=2) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) +
+  scale_color_viridis(option = "magma", name = "Local Density") +
+  theme_minimal() +
+  labs(title = "Lightning Points Colored by Local Density",
+       x = "Longitude", y = "Latitude")
+```
+
+
+Import fire data:
+
+Scholten R C, Jandt R, Miller E A, Rogers B M and Veraverbeke S
+2021a ABoVE: ignitions, burned area and emissions of fires
+in AK, YT, and NWT, 2001–2018 (https://doi.org/10.3334/
+ORNLDAAC/1812)
+downloaded from: https://daac.ornl.gov/cgi-bin/dsviewer.pl?ds_id=1812
+
+From Hessilt et al (2022):
+Spatial  buffer:
+We focused on the time period from 2001 to 2018, but separated the Alaskan dataset between the old (2001–2012) and new (2012–2018) detection networks. Between 2001 and 2018, the positional accuracies differ in time and space. For assigning a wildfire start to an individual lightning cloud-to-ground flash occurrence, we imposed a 2.5 km buffer around the cloud-to-ground strikes from the old dataset and a 500 m buffer for the cloud-to-ground strikes from the new dataset.
+
+Temporal buffer:
+set the temporal constraint in the analysis to 120 h after each lightning strike (figure S1). We also accounted for a temporal uncertainty of one day in the timing of fire start.
+
+```{r}
+# Load raster fire data
+file_path <- file.path(data_root, "Alaska_ignition_locations_20012018/ignitions_20012018_AK.shp")
+fires_sf <- st_read(file_path)
+
+#filter out years before 2012
+fires_sf <- filter(fires_sf, year>=2012)
+str(fires_sf)
+
+#Only need fires in june, july, august:
+fires_sf <- fires_sf %>%
+  mutate(fire_date = as.Date(DOY - 1, origin = paste0(year, "-01-01")),
+         month = as.integer(format(fire_date, "%m"))) %>%
+  filter(month %in% c(6, 7, 8))
+
+ggplot() +
+  geom_sf(data = alaska, fill = "lightgray") +
+  geom_sf(data = fires_sf, color = "red", size = 2, alpha=0.1) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) +
+  theme_minimal() +
+  labs(title = "Fire start locations",
+       x = "Longitude", y = "Latitude")
+```
+
+Convert lightning_df to sf object with same crs as fires_sf (WGS84)
+```{r}
+# Convert lightning_df to sf object (WGS84)
+lightning_sf <- st_as_sf(df, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+# Transform lightning to fire CRS
+lightning_sf <- st_transform(lightning_sf, st_crs(fires_sf))
+str(lightning_sf)
+```
+Add unique row IDs
+```{r}
+# Add unique fire ID
+fires_sf <- fires_sf %>%
+  mutate(fire_id = row_number())
+
+#Add unique strike ID
+lightning_sf <- lightning_sf %>%
+  mutate(strike_id = row_number())
+
+```
+
+
+From Hessilt et al (2022):
+Spatial  buffer:
+We focused on the time period from 2001 to 2018, but separated the Alaskan dataset between the old (2001–2012) and new (2012–2018) detection networks. Between 2001 and 2018, the positional accuracies differ in time and space. For assigning a wildfire start to an individual lightning cloud-to-ground flash occurrence, we imposed a 2.5 km buffer around the cloud-to-ground strikes from the old dataset and a 500 m buffer for the cloud-to-ground strikes from the new dataset.
+
+Temporal buffer:
+set the temporal constraint in the analysis to 120 h after each lightning strike (figure S1). We also accounted for a temporal uncertainty of one day in the timing of fire start.
+
+Methods:
+
+1. add 2 columns  that represent the fire start window 
+      earliest start time = fire start time - 5 day (120 hours) (holdover fire)
+      latest start time = fire start time + 1 days 
+      
+2. join lightning sf and fire sf based on this window
+      any lightning that occurred within these windows is included in the join
+      
+3. add 500 (or 2500 for earlier dataset) buffer to the fire sf onject. 
+
+4. join lihgtning and fire sf based on this buffer
+      any lightning that occurred within the 500 m buffer is included in the join
+
+5. for fires with more than one lightning strike associated, calculate proximity index A
+
+1. Temporal Buffer
+```{r}
+fires_sf <- fires_sf %>% 
+  mutate(
+    fire_date_min = fire_date - 5,  #five days before to account for holdover fires
+    fire_date_max = fire_date + 1   #one day after to account timing uncertainty
+  ) %>%
+  filter(month %in% c(6, 7, 8))#only use summer months
+```
+
+
+2. Left join:
+Join each fire to any lightning row whose light_date falls between that fire’s fire_date_min and fire_date_max.
+If there are multiple lightning rows, the fire gets duplicated (one row per strike).
+If there are none, you get NA in the lightning columns.
+```{r}
+#drop geometries and make lightning data as.Date
+fires_df <- st_drop_geometry(fires_sf)
+
+lightning_df <- lightning_sf %>%
+  mutate(lightning_date = as.Date(UTCDATETIME)) %>%
+  st_drop_geometry()
+
+#apply non-equi join
+# fires_df: no geometry, one row per fire
+# lightning_df: no geometry, light_date = as.Date(UTCDATETIME)
+
+time_join <- fires_df %>%
+  left_join(
+    lightning_df,
+    by = join_by(
+      between(y$lightning_date, x$fire_date_min, x$fire_date_max)
+    ),
+    relationship = "many-to-many"
+  )
+```
+
+Separate lightning data and fire data back out - this keeps the datasets small
+```{r}
+#fire_id and strike_id will allow us to re-assigne geometries
+fires_df <- time_join %>% dplyr::select(fire_date, fire_id)
+
+lightning_time_df <- time_join %>% dplyr::select(UTCDATETIME, strike_id, fire_id) #keep fire 
+
+nrow(fires_df)
+nrow(lightning_time_df)
+
+#remove duplicate rows from fires_df:
+fires_df <- dplyr::distinct(fires_df)
+nrow(fires_df)
+```
+
+Reattach geometries
+```{r}
+fires_sf <- fires_sf %>%
+  filter(fire_id %in% time_join$fire_id)
+
+lightning_sf <- lightning_sf %>%
+  filter(strike_id %in% time_join$strike_id)
+
+```
+
+3. Add 500 meter buffer around each fire
+```{r}
+#This code takes a while so read in saved shp, below
+fires_buff <- st_buffer(fires_sf, dist = 500)
+```
+
+4. Join lightning and fire sf based on this buffer
+```{r}
+
+fires_light_spatial <- st_join(
+  fires_buff,
+  lightning_sf,
+  join = st_intersects,
+  left = FALSE
+) 
+
+nrow(fires_light_spatial)
+head(fires_light_spatial)
+```
+
+5. for fires with more than one lightning strike associated, calculate proximity index A
+
+Calculate T, time lag
+```{r}
+#drop geometry
+pairs <- fires_light_spatial %>%
+  st_drop_geometry() %>%
+  dplyr::select(fire_id, strike_id, fire_date, UTCDATETIME) %>%
+  distinct()
+#calculate lat time, T in hours
+# Hessilt's T=lag between lightninng and fire detection (in hours):
+      #T = t_fireDetect - t_lightning
+
+pairs <- pairs %>%
+  mutate(
+    fire_time = as.POSIXct(fire_date, tz="UTC"),
+    T_hours   = as.numeric(difftime(fire_time, UTCDATETIME, units="hours"))
+  ) %>%
+  filter(
+    between(T_hours, -24, 120)
+  ) %>%
+  mutate(
+    # convert to forward lag for A
+    T = pmax(0, T_hours)
+  )
+
+
+```
+
+Calculate S, distance between fire and lightning (km)
+```{r}
+# keep geometry + id
+fire_pts <- fires_sf %>% dplyr::select(fire_id)        # geometry = fire location
+ltg_pts  <- lightning_sf %>% dplyr::select(strike_id)  # geometry = strike location
+
+# align rows with pairs
+fire_pts_m <- fire_pts[match(pairs$fire_id, fire_pts$fire_id), ]
+ltg_pts_m  <- ltg_pts[match(pairs$strike_id, ltg_pts$strike_id), ]
+
+# distance in meters (your Albers CRS is in metres), then convert to km
+dists_m <- st_distance(fire_pts_m, ltg_pts_m, by_element = TRUE)
+pairs$S_km <- as.numeric(dists_m) / 1000
+
+hist(pairs$T_hours)
+```
+
+Compute Proximity index A
+```{r}
+
+Scon_km <- 0.5  # or 2.5 for your earlier dataset
+
+pairs <- pairs %>%
+  mutate(
+    A = (1 - T / 120) * (1 - S_km / Scon_km)
+  ) %>%
+  # keep only valid combinations
+  filter(
+    S_km    <= Scon_km,
+    A > 0
+  )
+
+head(pairs)
+nrow(pairs)
+```
+For each fire (fire_id), select the lightning strike with the highest value of A. 
+```{r}
+best_strikes <- pairs %>%
+  group_by(fire_id) %>%
+  slice_max(order_by = A, n = 1, with_ties = FALSE) %>%
+  ungroup()
+nrow(best_strikes)
+```
+
+Next, we need to reassign geometries and select strikes that do not cause a fire. 
+We will use the location and time of the strike, since this is what caused the fire. 
+```{r}
+lightning_positives_sf <- lightning_sf %>%
+  filter(strike_id %in% best_strikes$strike_id)
+```
+
+Next, we sample strikes that did not result in a fire ignition. 
+
+My model says:
+p = P(fire ignition | climate, fuel moisture, and landcover in a 0.5 degree girdcell, plus "a strike happened here")
+for each stirke, I have a vector of predictors X for its cell + day (or cell + time window):
+- climate (T, RH, wind, precip, SWR, SP)
+- fuel moisture index (DFM, DM, FFMC)
+- broadleaf/needleaf/open land fractions in that 0.5 degree cell
+
+Then the outcome is:
+y=1 for caused fire
+y=0 for no fire
+
+It's okay that multiple strikes share the same X but have differnt y - it just means: under those conditions X, igntiion is probablistic - some strikes catch catch, most dont.
+Logistic/Bayesian models are built for htis - multiple bernoulli draws withthe same p(X). 
+
+So, what does this mean for sampling 0 outcome strikes? I want to sample 0 strieks that are in a similar time and location to the fire. 
+- nearby gridcell (1-3 grid cells away)
+- under similar large-scale climate (same storm and similar fuel moisture)
+- under similar land cover 
+
+if we pick strikes from far away or in different time periods, the model would only learn that fires happen in boreal conifer in june an 0 stikes happen in random tundra or ocean cells, instead of given that we're in boreal conifer in June, hot/dry/windy strieks are more likely to ingint that cool/wet ones. 
+
+Set up paraemters:
+```{r}
+# parameters
+k_neg       <- 10         # number of negatives per fire
+radius_km   <- 100       # spatial neighborhood
+radius_m    <- radius_km * 1000
+t_min_hours <- -24       # 24h after fire detection
+t_max_hours <- 120       # 5 days before fire detection
+
+# make sure lightning is in same CRS as fires
+lightning_sf <- st_transform(lightning_sf, st_crs(fires_sf))
+
+
+```
+
+function to sample 0 outcome for one fire
+- takes one row of fires_sf, 
+- finds all lightning in the same window and within radius_km
+- excludes known 1 outcomes
+- samples k_neg negatives
+- returns an sf with those strikes, the fire they are matched to, and case = 0 
+```{r}
+sample_negatives_for_fire <- function(fire_row,
+                                      lightning_sf,
+                                      k = 5,
+                                      t_min_hours = -24,
+                                      t_max_hours = 120,
+                                      radius_km = 100,
+                                      positives_df = NULL) {
+  # fire_row is a 1-row sf
+  fire_id   <- fire_row$fire_id
+  fire_time <- as.POSIXct(fire_row$fire_date, tz = "UTC")
+  
+  # time window for candidate negatives
+  t_start <- fire_time + as.difftime(t_min_hours, units = "hours")
+  t_end   <- fire_time + as.difftime(t_max_hours, units = "hours")
+  
+  # first: temporal filter on lightning
+  ltg_time <- lightning_sf %>%
+    filter(UTCDATETIME >= t_start,
+           UTCDATETIME <= t_end)
+  
+  if (nrow(ltg_time) == 0) return(NULL)
+  
+  # spatial filter: within radius_km of fire
+  radius_m <- radius_km * 1000
+  
+  idx_space <- st_is_within_distance(
+    fire_row,          # single fire geometry
+    ltg_time,          # candidate lightning
+    dist = radius_m
+  )[[1]]
+  
+  if (length(idx_space) == 0) return(NULL)
+  
+  cand <- ltg_time[idx_space, ]
+  
+  # OPTIONAL: exclude known positive strike(s) for this fire
+  # positives_df is expected to have columns fire_id, strike_id
+  if (!is.null(positives_df)) {
+    pos_strikes <- positives_df %>%
+      filter(fire_id == fire_id) %>%
+      pull(strike_id)
+    
+    if (length(pos_strikes) > 0) {
+      cand <- cand %>%
+        filter(!(strike_id %in% pos_strikes))
+    }
+  }
+  
+  if (nrow(cand) == 0) return(NULL)
+  
+  # sample up to k negatives
+  n_samp <- min(k, nrow(cand))
+  
+  cand_sample <- cand %>%
+    slice_sample(n = n_samp) %>%
+    mutate(
+      fire_id = fire_id,
+      case = 0L   # 0 = no fire (negative)
+    )
+  
+  cand_sample
+}
+
+
+
+```
+
+Apply to all fires
+```{r}
+# use table of 1 outcomes to make sure they arent are resampled:
+positives_df <- best_strikes %>% dplyr::select(fire_id, strike_id)
+
+#filter for fires associated with lightning (fires_sf is all fires)
+case_fires <- fires_sf %>%
+  semi_join(best_strikes, by = "fire_id")
+
+set.seed(123)
+
+neg_list <- map(
+  1:nrow(fires_sf),
+  ~ sample_negatives_for_fire(
+      fire_row     = case_fires[.x, ], 
+      lightning_sf = lightning_sf,
+      k            = k_neg,
+      t_min_hours  = t_min_hours,
+      t_max_hours  = t_max_hours,
+      radius_km    = radius_km,
+      positives_df = positives_df
+    )
+)
+
+# bind all non-NULL results into one sf
+lightning_negatives_sf <- neg_list %>%
+  compact() %>%   # drop NULLs (fires with no eligible negatives)
+  reduce(rbind)
+
+str(lightning_negatives_sf)
+
+#sample from 0 outcomes:
+nsamples <- 3*nrow(lightning_positives_sf)
+set.seed(123)
+
+lightning_negatives_sf <- lightning_negatives_sf %>%
+  slice_sample(n = nsamples, , replace = FALSE)
+```
+
+Combine 0 and 1 strikes
+```{r}
+lightning_negatives_sf
+
+lightning_positives_sf
+#add column of 1 outcomes
+lightning_positives_sf <- lightning_positives_sf %>%
+  mutate(case = 1L)
+#bind sf's
+all_strikes_sf <- bind_rows(lightning_positives_sf, lightning_negatives_sf)
+#get date
+all_strikes_sf <- all_strikes_sf %>%
+  mutate(date = as.Date(UTCDATETIME))
+#extract lat/lon from geometries
+all_strikes_lonlat <- st_transform(all_strikes_sf, crs = 4326)
+#extract coords
+coords <- st_coordinates(all_strikes_lonlat)
+
+all_strikes_df <- all_strikes_lonlat %>%
+  st_drop_geometry() %>%
+  mutate(
+    lon = coords[,1],
+    lat = coords[,2],
+    caused_fire = case   # rename for clarity
+  ) %>%
+  dplyr::select(date, lat, lon, caused_fire)
+
+head(all_strikes_df)
+```
+
+view data
+```{r}
+all_strikes_sf <- st_as_sf(all_strikes_df, coords = c("lon", "lat"), crs = 4326)
+
+ggplot() + 
+  geom_sf(data = alaska) +
+  geom_sf(data = all_strikes_sf, aes(color=as.factor(caused_fire), alpha=0.1)) +
+  coord_sf(xlim = c(-180, -120), ylim = c(47, 80)) 
+
+
+ggplot() +
+  geom_point(data=all_strikes_df, aes(x=date, y=as.factor(caused_fire)))
+
+write.csv(all_strikes_sf, file.path(data_root,"binary_fire_lightning_matches_2012_2018.csv"))
+```
+
+true event rate (tau) and event rate in sampled data (ybar)
+```{r}
+total_lightning_count <- nrow(df)
+sampled_lightning_count <- nrow(all_strikes_sf)
+
+ignition_count <- sum(all_strikes_sf$caused_fire)
+
+tau <- sum(all_strikes_sf$caused_fire)/nrow(df)
+ybar <- sum(all_strikes_sf$caused_fire)/nrow(all_strikes_sf)
+
+lightning_count <- c(total_lightning_count, sampled_lightning_count)
+ignition_count <- c(ignition_count, ignition_count)
+event_rate <- c(tau, ybar)
+dataset <- c("population", "sample")
+
+correction_values <- data.frame(cbind(dataset, lightning_count, ignition_count, event_rate))
+
+write.csv(correction_values, file.path(table_root,"ignition_event_rates_2012_2018_10x.csv"))
+```
+

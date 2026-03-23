@@ -1,0 +1,263 @@
+---
+title: "Figure_C1-2"
+author: "Charlotte Uden"
+date: "2026-03-13"
+output: html_document
+---
+
+```{r}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidytext)
+library(patchwork)
+```
+
+#########################
+Lightning strike rate
+#########################
+
+Figure C1. Ransom forest results testing variable importance in predicting lightning strike rate. Metrics include (a) percent increase in mean square error (%IncMSE) and (b) increase in node impurity (IncNodePurity). Predictor variables include monthly mean wind speed (m/s), relative humidity (rh; %), shortwave radiation (swr; W/m2)), precipitation (precip; mm), surface pressure (sp; Pascal), and temperature (tair; °C). Color indicates the training period. 
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths
+```
+
+```{r}
+rf_r_strike_1 <- read.csv(file.path(table_root, "lightning_random_forest_results_2002_2011.csv"))
+rf_r_strike_1$years <- rep("2002-2011", nrow(rf_r_strike_1))
+```
+
+
+```{r}
+rf_r_strike_2 <- read.csv(file.path(table_root, "lightning_random_forest_results_2012_2018.csv"))
+rf_r_strike_2$years <- rep("2012-2018", nrow(rf_r_strike_2))
+
+rf_r_strike <- rbind(rf_r_strike_2, rf_r_strike_1)
+head(rf_r_strike)
+```
+
+
+```{r}
+#-------------------------
+# IncMSE plot
+#-------------------------
+rf_mse <- rf_r_strike %>%
+  select(Variable, IncMSE, years) %>%
+  group_by(Variable) %>%
+  mutate(order_val = mean(IncMSE, na.rm = TRUE)) %>%
+  ungroup()
+
+p_mse <- ggplot(rf_mse,
+                aes(x = IncMSE,
+                    y = reorder(Variable, order_val),
+                    fill = years)) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_mse$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,    
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(a)",
+    x = "%IncMSE",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  ) + 
+  theme(legend.position = "none")
+
+#-------------------------
+# IncNodePurity plot
+#-------------------------
+rf_node <- rf_r_strike %>%
+  select(Variable, IncNodePurity, years) %>%
+  group_by(Variable) %>%
+  mutate(order_val = mean(IncNodePurity, na.rm = TRUE)) %>%
+  ungroup()
+
+p_node <- ggplot(rf_node,
+                 aes(x = IncNodePurity,
+                     y = reorder(Variable, order_val),
+                     fill = years)) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_node$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,         # circle with border
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(b)",
+    x = "IncNodePurity",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  )
+
+(p_mse + p_node) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_C1.png"), plot = last_plot(), width = 8, height = 4, dpi = 750)
+```
+
+#########################
+Ignition Efficiency
+#########################
+
+Figure C2. Random forest results testing variable importance in predicting lightning ignition efficiency. The x-axis of each plot shows (a) percent increase in mean square error (%IncMSE) and (b) increase in node impurity (IncNodePurity). X-axes display predictor variables: monthly mean wind speed (m/s), relative humidity (rh; %), precipitation (precip; mm), temperature (tair; °C), fine fuel moisture code (FFMC), duff moisture code (DMC), and drought code (DC), % conifer cover (C), % broadleaf cover (B), and % unvegetated/openland (U). Color indicates training period. 
+
+```{r}
+rf_p_ignite_1 <- read.csv(file.path(table_root, "ignition_efficiency_random_forest_results_2012_2018.csv"))
+rf_p_ignite_1$years <- rep("2012-2018", nrow(rf_p_ignite_1))
+```
+
+
+```{r}
+rf_p_ignite_2 <- read.csv(file.path(table_root, "ignition_efficiency_random_forest_results_2002_2011.csv"))
+rf_p_ignite_2$years <- rep("2002-2011", nrow(rf_p_ignite_2))
+
+rf_p_ignite <- rbind(rf_p_ignite_2, rf_p_ignite_1)
+```
+
+
+```{r}
+#-------------------------
+# IncMSE plot
+#-------------------------
+rf_mse <- rf_p_ignite %>%
+  select(Variable, IncMSE, years) %>%
+  group_by(Variable) %>%
+  mutate(order_val = mean(IncMSE, na.rm = TRUE)) %>%
+  ungroup()
+
+p_mse <- ggplot(rf_mse,
+                aes(x = IncMSE,
+                    y = reorder(Variable, order_val),
+                    fill = years)) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_mse$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,    
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(a)",
+    x = "%IncMSE",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  ) + 
+  theme(legend.position = "none")
+
+#-------------------------
+# IncNodePurity plot
+#-------------------------
+rf_node <- rf_p_ignite %>%
+  select(Variable, IncNodePurity, years) %>%
+  group_by(Variable) %>%
+  mutate(order_val = mean(IncNodePurity, na.rm = TRUE)) %>%
+  ungroup()
+
+p_node <- ggplot(rf_node,
+                 aes(x = IncNodePurity,
+                     y = reorder(Variable, order_val),
+                     fill = years)) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_node$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,         # circle with border
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(b)",
+    x = "IncNodePurity",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  )
+
+(p_mse + p_node) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_C2.png"), plot = last_plot(), width = 8, height = 5, dpi = 750)
+```
+
+
+

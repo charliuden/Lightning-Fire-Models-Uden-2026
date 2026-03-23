@@ -1,0 +1,340 @@
+---
+title: "Figure 2"
+author: "Charlotte Uden"
+date: "2026-01-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(scales)
+library(stringr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths 
+```
+
+```{r}
+df <- read.csv(file.path(table_root, "lightning_model_performance.csv"))
+
+# Define the desired order
+desired_order <- c("CAPE", "CAPE x Pr", "RH + Rsds + T + Ps + Pr + U10")
+
+df <- df %>%
+  dplyr::mutate(
+    predictors    = factor(predictors, levels = desired_order),
+    model      = factor(model, levels = c("LM", "Gamma GLM", "Gamma Bayesian")),
+    training_period = factor(training_period, levels = c("2001-2012", "2012-2018"))
+  )
+```
+
+Note: some spcor esimates fall outside the confidence interval - this is normal. Explanation in a reviewer asks:
+
+Bootstrap confidence intervals were computed from the distribution of statistics over 1,000 resampled test sets. As a result, the original test-set estimate is not constrained to lie within the percentile-based confidence interval, particularly when the sampling distribution is skewed. We interpret these intervals as approximations of the sampling uncertainty, rather than as strict bounds on the observed test statistic.
+
+```{r}
+# A base theme for a clean, publication-style look
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    #panel.grid.major.y = element_blank(),
+    #panel.grid.minor   = element_blank(),
+    axis.title.y       = element_blank(),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.title       = element_text(size = 10),
+    legend.text        = element_text(size = 9)
+  )
+
+# ------------------ Normalized RMSE ------------------ #
+p_nrmse <- ggplot(df,
+                aes(x = nrmse, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = nrmse_ci_low,
+                     xmax = nrmse_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_reverse(
+    breaks = seq(0, 14, by = 1),
+    labels = label_number(accuracy = 1)) +
+  coord_cartesian(xlim = c(14, 0)) + 
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "nRMSE",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(a)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+# ------------------ Correlation ------------------ #
+p_cor <- ggplot(df,
+                aes(x = cor, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = cor_ci_low,
+                     xmax = cor_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_continuous(
+    limits = c(-0.1, 0.7),
+    breaks = seq(-0.1, 0.7, by = 0.1),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "Correlation",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(b)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =30, b = 10, l = 10)) +
+  scale_y_discrete(position = "right",
+                   labels = function(x) str_wrap(x, width = 15)) +
+  theme(legend.position = "none")
+
+# ------------------ S-SCORE------------------ #
+p_sscore <- ggplot(df,
+                  aes(x = sscore, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = sscore_ci_low,
+                     xmax = sscore_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_continuous(
+    limits = c(0.5, 1),
+    breaks = seq(0.5, 1, by = 0.1),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "S-score",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(c)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+# ------------------ SPATIAL CORRELATION ------------------ #
+p_spcor <- ggplot(df,
+                  aes(x = spcor, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = spcor_ci_low,
+                     xmax = spcor_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_continuous(
+    breaks = seq(-0.1, 0.7, by = 0.1),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "Spatial Correlation",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(d)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =30, b = 10, l = 10)) +
+  scale_y_discrete(position = "right",
+                   labels = function(x) str_wrap(x, width = 15)) +
+  theme(legend.position = "none")
+
+# ------------------ ANOMALY CORRELATION COEFFICIENT ------------------ #
+p_acc <- ggplot(df,
+                  aes(x = acc, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = acc_ci_low,
+                     xmax = acc_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_continuous(
+    breaks = seq(-1, 1, by = 0.1),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "ACC",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(e)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+# ------------------ nRMSE of ANOMALIES ------------------ #
+p_nrmseA <- ggplot(df,
+                  aes(x = nrmseA, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = nrmseA_ci_low,
+                     xmax = nrmseA_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_reverse(
+    breaks = seq(0, 5, by = 0.5),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  coord_cartesian(xlim = c(5, 0)) + 
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "nRMSE of Anomalies",
+    y = NULL,
+    color = "Approach",
+    shape = "Training period"
+  ) +
+  ggtitle("(f)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =30, b = 10, l = 10)) +
+  scale_y_discrete(position = "right",
+                   labels = function(x) str_wrap(x, width = 15)) +
+  theme(legend.position = "none")
+
+
+# ------------------ COMBINE PANELS ------------------ #
+
+# Extract the legend
+#----
+# Function to extract the legend from a ggplot object
+extract_legend <- function(my_plot) {
+  g <- ggplotGrob(my_plot)  # Convert plot to grob
+  legend <- g$grobs[which(sapply(g$grobs, function(x) x$name) == "guide-box")][[1]]
+  return(legend)  # Returns the legend as a grob
+}
+
+legend_plot <- ggplot(df,
+                  aes(x = nrmseA, y = predictors,
+                    color = model,
+                    shape = training_period)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = nrmseA_ci_low,
+                     xmax = nrmseA_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_continuous(
+    breaks = seq(0, 5, by = 0.5),
+    labels = label_number(accuracy = 0.1)
+  ) +
+  coord_cartesian(xlim = c(-2, 14)) + 
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "nRMSE of Anomalies",
+    y = NULL,
+    color = "Approach",
+    shape = "Years"
+  ) +
+  ggtitle("(f)") +
+  base_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  scale_y_discrete(position = "right",
+                   labels = function(x) str_wrap(x, width = 15)) +
+  theme(
+    legend.box = "horizontal",
+    legend.text = element_text(size = 10),
+    legend.key.height = unit(0.5, "cm"), # Add a small height back
+    legend.key.width = unit(1.5, "cm"),  # Slightly reduced width
+    legend.spacing.x = unit(0.5, "cm")
+  ) +
+  guides(
+    color = guide_legend(ncol = 3),
+    shape = guide_legend(ncol = 3) 
+  )
+
+#----
+
+legend_grob <- extract_legend(legend_plot)
+
+
+p <- grid.arrange(p_nrmse, p_cor, p_sscore, p_spcor, p_acc, p_nrmseA, legend_grob, nrow=4, ncol=2, heights=c(1,1,1,0.2), widths=c(1, 1), layout_matrix=rbind(c(1, 2), c(3, 4), c(5, 6), c(7,7)))
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_2.png"), plot = p, width = 10, height = 9, dpi = 1100, units = "in")
+```
+

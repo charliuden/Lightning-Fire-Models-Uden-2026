@@ -1,0 +1,890 @@
+---
+title: "Fire_Probability_Predictions"
+author: "Charlotte Uden"
+date: "2026-01-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(rstan)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(data.table)
+library(arrow)
+library(lubridate)
+library(terra)
+library(sf)
+library(MASS)
+library(fields)
+library(geosphere)
+library(ggspatial)
+library(viridis)
+library(rlang)  
+library(data.table)
+
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+```
+
+--------------------
+--------------------
+Predict P_ignite
+--------------------
+--------------------
+
+Daily ERA5 climate and fuel moisture, and landcover data 
+```{r}
+drivers_file_path <- file.path(drivers_root, "fire_probability_daily_drivers_2002_2011.parquet")
+daily_df <- read_parquet(drivers_file_path)
+
+daily_df <- daily_df %>% dplyr::select(lat, lon, date, temperature, precipitation, wind, relative_humidity, FFMC, DMC, DC, C, B, U, cell_id)
+
+df_complete <- daily_df[complete.cases(daily_df), ]
+df_with_na <- daily_df[!complete.cases(daily_df), ]
+
+start_date <- as.POSIXct("2002-05-31 20:00:00")
+df_complete_day <- df_complete[df_complete$date == start_date, ]
+df_with_na_day <- df_with_na[df_with_na$date == start_date, ]
+
+ggplot(df_complete_day, aes(x=lon, y=lat)) + geom_point()
+ggplot(df_with_na_day, aes(x=lon, y=lat)) + geom_point() #NAs are ocean 
+
+daily_df <- df_complete
+```
+
+We chose the bayesian model trained on all variables for the 2002-2011 period:
+The daily data needs to be standardize using means and sd's from the training data - luckily, these values are saved in the model!
+```{r}
+rds_file_path <- file.path(rds_root, "m7.1_bayes_2002_2011_climate.rds")
+model <- readRDS(rds_file_path)
+
+names(model)
+
+# Logistic function for convenience
+logistic <- function(x) 1 / (1 + exp(-x))
+
+predict_bayes_logit_ridge <- function(fit,
+                                      newdata,
+                                      type = c("response", "link", "class"),
+                                      threshold = 0.5) {
+  type <- match.arg(type)
+
+  # 1. Get predictor names from the fitted object
+  preds <- fit$predictors
+
+  # Check that all predictors are present
+  missing_preds <- setdiff(preds, names(newdata))
+  if (length(missing_preds) > 0) {
+    stop("The following predictors are missing from newdata: ",
+         paste(missing_preds, collapse = ", "))
+  }
+
+  # 2. Get training means and sds from fit$scale_values
+  scale_vals <- fit$scale_values
+
+  # Handle several possible shapes: matrix, data.frame, or list
+  if (is.matrix(scale_vals) || is.data.frame(scale_vals)) {
+    if (!all(c("mean", "sd") %in% colnames(scale_vals))) {
+      stop("scale_values must have columns named 'mean' and 'sd'.")
+    }
+    mu <- scale_vals[, "mean"]
+    sd <- scale_vals[, "sd"]
+    # Name them by rownames if available
+    if (!is.null(rownames(scale_vals))) {
+      names(mu) <- rownames(scale_vals)
+      names(sd) <- rownames(scale_vals)
+    }
+  } else if (is.list(scale_vals) && all(c("mean", "sd") %in% names(scale_vals))) {
+    mu <- scale_vals$mean
+    sd <- scale_vals$sd
+  } else {
+    stop("Unsupported format for fit$scale_values.")
+  }
+
+  # Keep only the predictors used in the model, in correct order
+  mu <- mu[preds]
+  sd <- sd[preds]
+
+  # 3. Build design matrix and standardize with training stats
+  X <- as.matrix(newdata[, preds, drop = FALSE])
+
+  X_scaled <- sweep(X, 2, mu, FUN = "-")
+  X_scaled <- sweep(X_scaled, 2, sd, FUN = "/")
+
+  # 4. Coefficients (posterior means)
+  alpha <- fit$coef_means$alpha
+  beta  <- fit$coef_means$beta[preds]
+
+  # 5. Linear predictor + probabilities
+  eta <- as.numeric(alpha + X_scaled %*% beta)
+  p   <- logistic(eta)
+
+  if (type == "link") {
+    return(eta)
+  } else if (type == "response") {
+    return(p)
+  } else {  # "class"
+    return(ifelse(p >= threshold, 1L, 0L))
+  }
+}
+
+
+
+# Predicted probabilities of caused_fire for new data
+daily_df$P_ignite_prob <- predict_bayes_logit_ridge(
+  fit     = model,
+  newdata = daily_df,
+  type    = "response"
+)
+
+# Optional: predicted classes using 0.5 cutoff
+daily_df$P_ignite_class <- predict_bayes_logit_ridge(
+  fit       = model,
+  newdata   = daily_df,
+  type      = "class",
+  threshold = 0.5
+)
+
+```
+
+r_strike: lightning Prediction
+Get training data to find mean and sd of each variable in the training data
+```{r}
+drivers_file_path <- file.path(drivers_root, "lightning_prediction_drivers_2002_2011.parquet")
+train_df <- read.csv(drivers_file_path)[,2:11]
+
+colnames(train_df) <- c("year", "lon", "lat", "strikes", "tair", "precip", "wind", "swr", "sp", "rh")
+head(train_df)
+```
+
+Split into train and test, get mean and sd for standardization
+```{r}
+set.seed(123)
+n <- nrow(train_df)
+
+train_size <- floor(0.8 * n)
+train_index <- sample(seq_len(n), size = train_size)
+  
+train <- train_df[train_index, , drop = FALSE]
+test  <- train_df[-train_index, , drop = FALSE]
+
+#save mean and sd of training data
+mu_precip <- mean(train$precip)
+sigma_precip <- sd(train$precip)
+mu_tair <- mean(train$tair)
+sigma_tair <- sd(train$tair)
+mu_wind <- mean(train$wind)
+sigma_wind <- sd(train$wind)
+mu_swr <- mean(train$swr)
+sigma_swr <- sd(train$swr)
+mu_sp <- mean(train$sp)
+sigma_sp <- sd(train$sp)
+mu_rh <- mean(train$rh)
+sigma_rh <- sd(train$rh)
+mu_cape <- mean(train$cape)
+sigma_cape <- sd(train$cape)
+mu_cxp <- mean(train$cxp)
+sigma_cxp <- sd(train$cxp)
+```
+  
+
+```{r}
+drivers_file_path <- file.path(drivers_root, "fire_probability_seasonal_drivers_2002_2011.parquet")
+seasonal_df <- read_parquet(drivers_file_path)
+
+#standardize
+seasonal_df <- seasonal_df %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(temp = (temp-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh)
+```
+
+Make lightning strike rate predictions
+- we chose the Gamma GLM model for the 2002-2011 training period
+```{r}
+table_file_path <- file.path(table_root, "lightning_model_coefficients_2012_2018.csv")
+model <- read.csv(table_file_path)
+head(model)
+
+#original model structure:
+#N13 <- lm(strikes ~ swr + tair + rh + wind + precip + sp, data = train)
+
+# a <- model[3, 3]
+# b <- model[3, 4]
+# c <- model[3, 5]
+# d <- model[3, 6]
+# e <- model[3, 7]
+# f <- model[3, 8]
+# g <- model[3, 9]
+# 
+# 
+# seasonal_df <- mutate(seasonal_df, 
+#                       r_strike = a + 
+#                         b*swr + 
+#                         c*temp + 
+#                         d*rh +
+#                         e*wind + 
+#                         f*precip + 
+#                         g*sp)
+
+#Using Gamma GLM:
+#G13 <- glm(strikes ~ swr + tair + rh + wind + precip + sp,
+                 #data = train,
+                 #family = Gamma(link =log))
+#y_pred_G13 <- exp(a + b*test$swr + c*test$tair + d*test$rh +e*test$wind + f*test$precip + g*test$sp)
+
+a <- model[6, 3]
+b <- model[6, 4]
+c <- model[6, 5]
+d <- model[6, 6]
+e <- model[6, 7]
+f <- model[6, 8]
+g <- model[6, 9]
+
+
+seasonal_df <- mutate(seasonal_df, 
+                      r_strike = exp(a + 
+                        b*swr + 
+                        c*temp + 
+                        d*rh +
+                        e*wind + 
+                        f*precip + 
+                        g*sp))
+
+
+head(seasonal_df)
+```
+
+Calculate P_fire
+
+P_fire = 1 - (1 - P_ignite)^r_strike
+
+```{r}
+
+# 1. Prepare seasonal_df: keep only the columns we need, handle NAs in r_strike
+seasonal_clean <- seasonal_df %>%
+  dplyr::select(cell_id, r_strike) %>%
+  replace_na(list(r_strike = 0))   # no seasonal strikes -> 0, not NA
+
+# 2. Join r_strike onto the daily data using cell_id
+daily_df <- daily_df %>%
+  left_join(seasonal_clean, by = "cell_id")
+
+# 3. (Optional) restrict to summer months if that's what r_strike represents
+#    e.g. JJA only:
+# daily_with_r <- daily_with_r %>%
+#   filter(month(date) %in% c(6, 7, 8))
+
+# 4. Compute daily strike rate and P_fire per day & gridcell
+daily_df <- daily_df %>%
+  mutate(
+    year  = year(date),
+    month = month(date),
+
+    # strip month-name attributes from days_in_month()
+    days_in_month = as.integer(unname(days_in_month(date))),
+
+    # strikes/day
+    r_strike_daily = r_strike / days_in_month,
+
+    # P_fire
+    P_fire = 1 - (1 - P_ignite_prob)^r_strike_daily
+  )
+
+
+head(daily_df)
+```
+
+View results
+```{r}
+mean_df <- daily_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    mean_r_strike = mean(r_strike, na.rm = TRUE),
+    mean_P_ignite = mean(P_ignite_prob, na.rm = TRUE),
+    mean_P_fire   = mean(P_fire, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p1 <- ggplot(data=mean_df, aes(x=lon, y=lat, color=mean_r_strike)) + geom_point() + ggtitle("Mean r_strike, 2002-2011")
+p2 <- ggplot(data=mean_df, aes(x=lon, y=lat, color=mean_P_ignite)) + geom_point() + ggtitle("Mean P_ignite, 2002-2011")
+p3 <- ggplot(data=mean_df, aes(x=lon, y=lat, color=mean_P_fire)) + geom_point() + ggtitle("Mean P_fire, 2002-2011")
+
+p1 + p2 + p3
+```
+
+
+Model Performance
+
+What the model predicts:
+For each grid cell i and day t:
+
+P_fire_i_t = P(>= 1 lightning-caused fire in cell i on day t)
+
+This is a bernoulli probability (not a count). 
+
+Observations consist of the fire start point with dates with each point corresponding to at least one ignition occurring. Multimple fires per grid cell per day are possible, but rare - the model does not include this possibility. Observations have been converted to a binary indicator:
+Y_i_t = if(>= lightning-caused fire occurs in cell i on day t, 1) else(0)
+
+
+Now, model evaluation is a standard probabilistic binary prediction task.  For rare event modeling, performance has tow orthogonal dimensions:
+1. Calibration: are predicted probabilites statistically consistent with observed frequencies?
+2. Discrimination: Do higher probabilites correspond to higher fire occurrence? 
+
+Read in observations
+```{r}
+observations_file_path <- file.path(drivers_root, "observed_binary_fire_data_2002-2018.shp")
+obs <- read.csv(observations_file_path)
+
+#only need 2002-2011 and summer months (6, 7, 8)
+obs <- obs %>% 
+  filter(lghtnn_ < date("2011-12-31")) %>%
+  filter(month(lghtnn_) %in% c(6, 7, 8))
+
+# Drop geometry -> plain data.frame
+obs_df <- sf::st_drop_geometry(obs)
+
+# Rename lghtnn_ -> date for consistency
+obs_df$date <- obs_df$lghtnn_
+obs_df$lghtnn_ <- NULL
+
+# Make sure date is Date (it already is, but this is safe)
+obs_df$date <- as.Date(obs_df$date)
+
+# Keep only needed columns
+obs_small <- obs_df[, c("lat", "lon", "date", "fire")]
+
+# Convert to data.table
+setDT(obs_small)
+
+```
+
+```{r}
+
+# Start from daily_df tibble
+daily_small <- daily_df[, c("lat", "lon", "date", "cell_id", "P_fire")]
+
+# Convert POSIXct to Date (drops the time-of-day part)
+daily_small$date <- as.Date(daily_small$date)
+
+# Convert to data.table
+setDT(daily_small)  # in-place conversion
+
+daily_small <- daily_small[
+  month(date) %in% 6:8  # if you have lubridate loaded AND date is still POSIXct
+]
+# (Or do that earlier on daily_df)
+
+```
+
+Add keys by lat, lon, date and merge
+```{r}
+# Set keys for fast join
+setkey(obs_small,   lat, lon, date)
+setkey(daily_small, lat, lon, date)
+
+# Join: add obs fire to each prediction row
+merged <- obs_small[daily_small, on = .(lat, lon, date)]
+
+#remove NA's
+merged <- na.omit(merged)
+
+daily_df$date <- as.Date(daily_df$date)
+setDT(daily_df)
+
+all_df <- merged[daily_df, on = .(lat, lon, date)]
+all_df <- na.omit(all_df)
+all_df <- dplyr::select(all_df, lat,lon,date,fire,cell_id,P_fire,temperature,precipitation,wind,relative_humidity,FFMC,DMC,DC,C,B,U,P_ignite_prob,P_ignite_class,r_strike,year,month,r_strike_daily,i.P_fire)
+
+predictions_file_path <- file.path(predictions_root, "drivers_predictions_and_observations_2002-2011_10x.csv")
+
+write.csv(all_df, predictions_file_path)
+```
+
+----------------------------
+Evaluation Metrics
+
+Descriptions of ROC-AUC, and PR-AUC can be found in section 2.3.1.  We also tested the model’s ability to reproduce observed fire counts by comparing ∑Pfire with the total number of observed fires in the simulation period. 
+
+
+```{r}
+## =========================================================
+## Helpers (used internally)
+## =========================================================
+
+# Drop NAs and check basic validity
+.clean_xy <- function(p, y) {
+  if (length(p) != length(y)) {
+    stop("p and y must have the same length.")
+  }
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]; y <- y[ok]
+  list(p = p, y = y)
+}
+
+# Clip probabilities away from 0 and 1 to avoid log(0)
+.clip_probs <- function(p, eps = 1e-15) {
+  p[p < eps]      <- eps
+  p[p > 1 - eps]  <- 1 - eps
+  p
+}
+
+## =========================================================
+## 1) Brier score
+## =========================================================
+# Mean squared error between probabilities and 0/1 outcomes
+brier_score <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  mean((p - y)^2)
+}
+
+
+## =========================================================
+## 2) ROC AUC (rank-based, no packages)
+## =========================================================
+# Area under ROC curve; threshold-free discrimination metric
+roc_auc <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  
+  y_vals <- unique(y)
+  if (!all(y_vals %in% c(0, 1))) {
+    stop("y must contain only 0 and 1.")
+  }
+  if (length(unique(y)) < 2) {
+    warning("y has no variation (all 0s or all 1s); ROC AUC undefined.")
+    return(NA_real_)
+  }
+  
+  # Rank predictions (average ranks for ties)
+  r <- rank(p, ties.method = "average")
+  
+  n_pos <- sum(y == 1)
+  n_neg <- sum(y == 0)
+  
+  # Sum of ranks for positive cases
+  sum_r_pos <- sum(r[y == 1])
+  
+  # Mann-Whitney U statistic -> AUC
+  auc <- (sum_r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  auc
+}
+
+## =========================================================
+## 3) Precision–Recall AUC (PR-AUC)
+## =========================================================
+# PR-AUC is more informative under class imbalance (rare fires)
+pr_auc <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  
+  y_vals <- unique(y)
+  if (!all(y_vals %in% c(0, 1))) {
+    stop("y must contain only 0 and 1.")
+  }
+  P <- sum(y == 1)
+  N <- sum(y == 0)
+  if (P == 0) {
+    warning("No positive events in y; PR-AUC undefined.")
+    return(NA_real_)
+  }
+  
+  # Sort by decreasing probability
+  o <- order(p, decreasing = TRUE)
+  y_sorted <- y[o]
+  p_sorted <- p[o]
+  
+  # Cumulative true positives and false positives
+  tp <- cumsum(y_sorted == 1)
+  fp <- cumsum(y_sorted == 0)
+  
+  recall    <- tp / P
+  precision <- tp / (tp + fp)
+  
+  # Add (0, baseline) point for integration
+  recall    <- c(0, recall)
+  precision <- c(mean(y), precision)  # baseline precision = prevalence
+  
+  # Trapezoidal rule in (recall, precision) space
+  # Note: recall is non-decreasing by construction
+  pr_auc_val <- sum(
+    0.5 * (precision[-1] + precision[-length(precision)]) *
+      diff(recall)
+  )
+  
+  pr_auc_val
+}
+
+## =========================================================
+## 4) Expected vs observed fire counts
+## =========================================================
+# Returns a named list: expected (sum of p), observed (sum of y)
+expected_observed_counts <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  list(
+    expected = sum(p),
+    observed = sum(y)
+  )
+}
+
+#note: we sum predicted probabilities because simulating 0/1 from the probability (ie sampling from a binomial distribution) adds noise - not good for model verification. 
+
+#expected fire counts are summed rather than stochastically sampled since the expected sum of Bernoulli  trials provides a deterministic and unbiased estimate of aggregate event frequency. 
+
+#later on, for something like forecasting or implementing into a DGVM, we would sample from a binomial distribution - variability contains information. 
+
+
+```
+
+
+```{r}
+p <- merged$P_fire
+y <- merged$fire
+
+predictions_file_path <- file.path(predictions_root,"fire_predictions_and_observations_2002-2011.csv")
+write.csv(data.frame(cbind(p, y)), predictions_file_path)
+
+brier_score(p, y)
+roc_auc(p, y)
+pr_auc(p, y)
+
+eo <- expected_observed_counts(p, y)
+eo$expected
+eo$observed
+
+
+```
+The model expresses the relative fire danger signal well (ROC-AUC, PR-AUC), but absolute fire probability is biased high (BSS < 0; expected > observed), indicating calibration issues at low event probabilities typical of rare fire ignition events.
+
+----------------------------
+#ROC and PR curves
+The ROC curve is built by sweeping thresholds and computing:
+TPR=sensitivity = recall
+FPR= false positive rate
+
+From section 2.3.1: 
+
+Area Under the ROC Curve (AUC) was also used by Hessilt et al. (2022). It indicates how well the model separates ignitions from non-ignitions across all possible probability thresholds. The ROC curve is a plot of true positive rate versus false positive rate as you vary the probability threshold. The area under this curve ranges from 0.5 (no skill) to 1 (perfect discrimination between ignitions and non-ignitions). 
+
+Precision-Recall AUC is particularly applicable when positive outcomes are rare (such as lightning-caused fire). Here, precision (true positive / (true positive / false positive)) is plotted against recall (true positive / (true positive + false negative), and the area under this curve (Precision-Recal AUC) indicates how accurately the model is catching true positives. Higher values indicate that the model is correctly predicting true ignitions, even when they are rare. 
+
+#ROC curve
+```{r}
+roc_curve_df <- function(p, y) {
+  stopifnot(length(p) == length(y))
+  stopifnot(all(y %in% c(0, 1)))
+
+  # Remove NAs
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]
+  y <- y[ok]
+
+  # Sort by decreasing probability
+  o <- order(p, decreasing = TRUE)
+  p <- p[o]
+  y <- y[o]
+
+  P <- sum(y == 1)
+  N <- sum(y == 0)
+
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+
+  tpr <- tp / P
+  fpr <- fp / N
+
+  # Add origin
+  data.frame(
+    fpr = c(0, fpr),
+    tpr = c(0, tpr),
+    threshold = c(Inf, p)
+  )
+}
+
+roc_df <- roc_curve_df(p, y)
+
+#add ROC AUC (area under the curve) to the plot
+auc_text <- sprintf("ROC AUC = %.3f", roc_auc(p, y))
+
+ggplot(roc_df, aes(fpr, tpr)) +
+  geom_line(size = 1) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  coord_equal() +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    title = "ROC Curve"
+  ) +
+  annotate("text", x = 0.75, y = 0.125, label = auc_text, 
+           color = "red", size = 4, fontface = "bold") +
+  theme_bw()
+
+```
+
+ROC: If you pick a random fire day (true positive) and one non-fire day (false positive), how often does the model assign a higher probability to the fire day? ROC AUC = 0.895 means that ~89% of the time, the model ranks the fire day higher - good! this means the model separates high-risk from low-risk days. 
+
+The steep rise near the origin means there is a high true positive rate at low false positive rates - the model can identify where fire is more likely. 
+
+#PR Curve
+```{r}
+pr_curve_df <- function(p, y) {
+  stopifnot(length(p) == length(y))
+  stopifnot(all(y %in% c(0, 1)))
+
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]
+  y <- y[ok]
+
+  o <- order(p, decreasing = TRUE)
+  p <- p[o]
+  y <- y[o]
+
+  P <- sum(y == 1)
+
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+
+  recall <- tp / P
+  precision <- tp / (tp + fp)
+
+  # Add baseline point
+  data.frame(
+    recall = c(0, recall),
+    precision = c(mean(y), precision),
+    threshold = c(Inf, p)
+  )
+}
+
+pr_df <- pr_curve_df(p, y)
+
+#annotate thresholds
+annot_thresh <- c(1e-4, 5e-4, 1e-3, 2e-3)
+#find closest rows to these thresholds
+ann_df <- lapply(annot_thresh, function(t) {
+  pr_df %>%
+    mutate(diff = abs(threshold - t)) %>%
+    slice_min(diff, n = 1)
+}) %>%
+  bind_rows() %>%
+  mutate(label = paste0("t=", format(threshold, scientific = TRUE)))
+
+auc_text <- sprintf("PR AUC = %.5f", pr_auc(p, y))
+
+ggplot(pr_df, aes(recall, precision)) +
+  geom_line(size = 1, color = "black") +
+  geom_hline(yintercept = mean(y), linetype = "dashed", color = "grey50") +
+
+  # annotation points
+  geom_point(data = ann_df,
+             aes(recall, precision),
+             color = "red", size = 3) +
+
+  geom_text(data = ann_df,
+            aes(recall, precision, label = label),
+            hjust = -0.1, vjust = 0,
+            size = 3.5) +
+
+  labs(
+    x = "Recall",
+    y = "Precision",
+    title = "Precision–Recall Curve"
+  ) +
+
+  annotate("text", x = 0.8, y = 0.0006,
+           label = auc_text,
+           color = "red", size = 4, fontface = "bold") +
+
+  theme_bw()
+
+
+#add PR AUC (area under the curve) to the plot
+# auc_text <- sprintf("PR AUC = %.5f", pr_auc(p, y))
+# 
+# ggplot(pr_df, aes(recall, precision, color=threshold)) +
+#   geom_line(size = 1) +
+#   geom_hline(yintercept = mean(y), linetype = "dashed", color = "grey50") +
+#   labs(
+#     x = "Recall",
+#     y = "Precision",
+#     title = "Precision–Recall Curve"
+#   ) +
+#   annotate("text", x = 0.8, y = 0.0006, label = auc_text, 
+#            color = "red", size = 4, fontface = "bold") +
+#   theme_bw()
+
+```
+Precision: high fire probabilities correspond to days with a fire
+Recall: day with a fire was identified by the model as high risk 
+
+Each row in pr_df is one decision threshold and performance you would get if you classified everything above that threshold as fire. 
+For example, if threshold=0.0065, then a fire is predicted only where P_fire?=>= 0.0065. That is, when the threshold is high, only fires happen when the risk is extreme. When the threshold is low, 'warn aggressively'- more fires are triggered. In other words, start by only trusting the highest-risk predictions (threshold is high so fewer probabilites result in a fire), slowly increase the threshold (more probabilities results in fire) and watch how many fires the model catches versus how many false alarms it makes.
+
+Looking at the plot, as thresholds decrease, more days are labeled fire, recall increases, and precision decreases. Recall increases because when more fires are predicted it catches more observed fires. Precision falls because when more fires are predicted, more of them will be on days that didn't see a fire. 
+
+PR AUC is very small. But PR AUC should be interpreted relative to the baseline (dashed line = prevalence - fraction of fire days). 
+observed fires = 272, total gridcell-days = over 4 million. So, the baseline precision (fire days / no fire days) is ~0.000067. The PR curve sits above the baseline, which means the model is better than random. 
+
+When modeling rare events like fire, it's common for PR AUC to shrink with rarity. Here, the key takeaway is that predicted risk matches days with fire and the model is better than random across all thresholds. 
+
+The curve concentrates fires in high-probability bins - gridcell-days with the highest predicted risk contain fires. This can be seen in the steep rise on the left hand side of the PR curve. Here, precision is high - days labeled high risk were observed to burn. Or, the model puts real fires disproportionately in the bins it labels high risk. While perfect classification is impossible, particularly for rare events, this model is able to identify high fire risk where fires cluster. 
+
+
+
+#Reliability curve with quantile binning
+(without quantile binning, all probabilities are in the first bin)
+```{r}
+
+reliability_curve_quantile <- function(p, y, nbins = 10) {
+  dat <- .clean_xy(p, y)
+  p <- dat$p; y <- dat$y
+  
+  # quantile-based breaks (to avoid empty bins) - based on the quantiles of predictions
+  probs  <- seq(0, 1, length.out = nbins + 1)
+  breaks <- quantile(p, probs = probs, na.rm = TRUE) 
+  breaks <- unique(breaks)  # in case of ties
+  
+  df <- data.frame(p = p, y = y) %>%
+    mutate(bin = cut(p, breaks = breaks, include.lowest = TRUE)) %>%
+    group_by(bin) %>%
+    summarise(
+      n          = n(),
+      mean_pred  = mean(p),
+      event_rate = mean(y),
+      .groups    = "drop"
+    )
+  
+  # extract numeric bounds
+  df$bin_lower <- as.numeric(sub("\\((.+),.*", "\\1", sub("\\[", "(", df$bin)))
+  df$bin_upper <- as.numeric(sub(".*,(.+)\\]", "\\1", sub("\\)", "]", df$bin)))
+  df$bin_mid   <- (df$bin_lower + df$bin_upper) / 2
+  
+  df %>%
+    dplyr::select(bin_lower, bin_upper, bin_mid, n, mean_pred, event_rate)
+}
+
+rel_tab <- reliability_curve_quantile(p, y, nbins = 10)
+rel_tab
+
+ggplot(rel_tab, aes(x = mean_pred, y = event_rate)) +
+  geom_point(shape = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  xlab("Mean predicted probability") +
+  ylab("Observed event frequency") +
+  ylim(0, 0.00065) +
+  xlim(0, 0.00065) +
+  theme_bw() 
+
+rel_tab <- mutate(rel_tab, n_pred = n*mean_pred, n_event = n*event_rate)
+
+ggplot(rel_tab, aes(x = n_pred, y = n_event)) +
+  geom_point(shape = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  xlab("Summed predicted probability") +
+  ylab("Summed observed event frequency") +
+  ylim(0, 270) +
+  xlim(0, 270) +
+  theme_bw() 
+
+```
+
+
+
+
+```{r}
+# Join: add daily_df to each 'merged' row
+setDT(daily_df)
+daily_df[, date := as.Date(date)]
+
+setkey(daily_df, cell_id, date)
+setkey(merged,   cell_id, date)
+
+out <- merged[daily_df]
+
+out <- as.data.frame(out)
+out <- dplyr::select(out, cell_id, lat, lon, date, temperature, precipitation, wind, relative_humidity, FFMC, DMC, DC, C, B, U, P_ignite_prob, r_strike, r_strike_daily, P_fire, fire)
+
+out$year <- year(out$date)
+
+summary_df <- out %>%
+  group_by(year) %>%
+  summarise(
+    mean_r_strike = mean(r_strike, na.rm = TRUE),
+    mean_P_ignite = mean(P_ignite_prob, na.rm = TRUE),
+    mean_P_fire   = mean(P_fire, na.rm = TRUE),
+    sum_fire   = sum(fire, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(year>2001)
+
+
+
+# summary_df <- na.omit(summary_df)
+# 
+# summary_df <- summary_df %>% pivot_longer(
+#     cols = c(mean_r_strike, mean_P_ignite, mean_P_fire, sum_fire),
+#     names_to = "fire_factor",
+#     values_to = "value"
+#   )
+
+# A base theme for a clean, publication-style look
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    title.position    = "top",
+    legend.title       = element_text(size = 10),
+  )
+
+p1 <- ggplot() + geom_line(data=summary_df, aes(x=year, y=mean_r_strike, color="blue")) + base_theme +
+  theme(legend.position = "none") + ggtitle("Predicted lightning strike rate") + ylab("strikes/m2/month")
+p2 <- ggplot() + geom_line(data=summary_df, aes(x=year, y=mean_P_ignite, color="orange")) + base_theme +
+  theme(legend.position = "none") + ggtitle("Predicted ignition efficiency") + ylab("probability")
+p3 <- ggplot() + geom_line(data=summary_df, aes(x=year, y=mean_P_fire, color="red")) + base_theme +
+  theme(legend.position = "none") + ggtitle("Predicted fire probability") + ylab("probability")
+p4 <- ggplot() + geom_line(data=summary_df, aes(x=year, y=sum_fire, color="green")) + base_theme +
+  theme(legend.position = "none") + ggtitle("Observed fire count") + ylab("number of fires")
+
+grid.arrange(
+  p1, p2, p3, p4,
+  nrow = 4, ncol = 1,
+  heights = c(1, 1, 1, 1)
+)
+                           
+
+```
+
+
+
+
+
+
+
+

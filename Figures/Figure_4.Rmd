@@ -1,0 +1,432 @@
+---
+title: "Figure_4"
+author: "Charlotte Uden"
+date: "2026-01-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+ROC and PR curves and reliability diagram
+
+```{r}
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths 
+```
+
+```{r}
+df <- read.csv(file.path(predictions_root, "fire_predictions_and_observations.csv"))
+head(df)
+#p = predicitons of fire prob, P_fire
+#y = binary observations of fire outcome: 0 or 1
+p <- df$p
+y <- df$y
+```
+
+```{r}
+## =========================================================
+## Helpers (used internally)
+## =========================================================
+
+# Drop NAs and check basic validity
+.clean_xy <- function(p, y) {
+  if (length(p) != length(y)) {
+    stop("p and y must have the same length.")
+  }
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]; y <- y[ok]
+  list(p = p, y = y)
+}
+
+# Clip probabilities away from 0 and 1 to avoid log(0)
+.clip_probs <- function(p, eps = 1e-15) {
+  p[p < eps]      <- eps
+  p[p > 1 - eps]  <- 1 - eps
+  p
+}
+
+## =========================================================
+## 1) Brier score
+## =========================================================
+# Mean squared error between probabilities and 0/1 outcomes
+brier_score <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  mean((p - y)^2)
+}
+
+## =========================================================
+## 2) Brier Skill Score (relative to climatology)
+## =========================================================
+# Baseline = climatological event probability (mean(y))
+# BSS = 1 - BS_model / BS_climatology
+brier_skill_score <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  
+  if (length(unique(y)) < 2) {
+    warning("y has no variation (all 0s or all 1s); BSS undefined.")
+    return(NA_real_)
+  }
+  
+  bs_model <- mean((p - y)^2)
+  p_clim   <- mean(y)
+  bs_clim  <- mean((p_clim - y)^2)
+  
+  if (bs_clim == 0) {
+    warning("Climatological Brier score is 0; BSS undefined.")
+    return(NA_real_)
+  }
+  
+  1 - bs_model / bs_clim
+}
+
+## =========================================================
+## 3) Logarithmic score (log loss)
+## =========================================================
+# Negative log-likelihood of Bernoulli outcomes under predicted probabilities
+log_loss <- function(p, y, eps = 1e-15) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  p <- .clip_probs(p, eps)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+
+
+## =========================================================
+## 4) ROC AUC (rank-based, no packages)
+## =========================================================
+# Area under ROC curve; threshold-free discrimination metric
+roc_auc <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  
+  y_vals <- unique(y)
+  if (!all(y_vals %in% c(0, 1))) {
+    stop("y must contain only 0 and 1.")
+  }
+  if (length(unique(y)) < 2) {
+    warning("y has no variation (all 0s or all 1s); ROC AUC undefined.")
+    return(NA_real_)
+  }
+  
+  # Rank predictions (average ranks for ties)
+  r <- rank(p, ties.method = "average")
+  
+  n_pos <- sum(y == 1)
+  n_neg <- sum(y == 0)
+  
+  # Sum of ranks for positive cases
+  sum_r_pos <- sum(r[y == 1])
+  
+  # Mann-Whitney U statistic -> AUC
+  auc <- (sum_r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  auc
+}
+
+## =========================================================
+## 5) Precision–Recall AUC (PR-AUC)
+## =========================================================
+# PR-AUC is more informative under class imbalance (rare fires)
+pr_auc <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  
+  y_vals <- unique(y)
+  if (!all(y_vals %in% c(0, 1))) {
+    stop("y must contain only 0 and 1.")
+  }
+  P <- sum(y == 1)
+  N <- sum(y == 0)
+  if (P == 0) {
+    warning("No positive events in y; PR-AUC undefined.")
+    return(NA_real_)
+  }
+  
+  # Sort by decreasing probability
+  o <- order(p, decreasing = TRUE)
+  y_sorted <- y[o]
+  p_sorted <- p[o]
+  
+  # Cumulative true positives and false positives
+  tp <- cumsum(y_sorted == 1)
+  fp <- cumsum(y_sorted == 0)
+  
+  recall    <- tp / P
+  precision <- tp / (tp + fp)
+  
+  # Add (0, baseline) point for integration
+  recall    <- c(0, recall)
+  precision <- c(mean(y), precision)  # baseline precision = prevalence
+  
+  # Trapezoidal rule in (recall, precision) space
+  # Note: recall is non-decreasing by construction
+  pr_auc_val <- sum(
+    0.5 * (precision[-1] + precision[-length(precision)]) *
+      diff(recall)
+  )
+  
+  pr_auc_val
+}
+
+## =========================================================
+## 6) Expected vs observed fire counts
+## =========================================================
+# Returns a named list: expected (sum of p), observed (sum of y)
+expected_observed_counts <- function(p, y) {
+  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+  list(
+    expected = sum(p),
+    observed = sum(y)
+  )
+}
+
+#note: we sum predicted probabilities because simulating 0/1 from the probability (ie sampling from a binomial distribution) adds noise - not good for model verification. 
+
+#expected fire counts are summed rather than stochastically sampled since the expected sum of Bernoulli  trials provides a deterministic and unbiased estimate of aggregate event frequency. 
+
+#later on, for something like forecasting or implementing into a DGVM, we would sample from a binomial distribution - variability contains information. 
+
+
+```
+
+#ROC curve
+```{r}
+roc_curve_df <- function(p, y) {
+  stopifnot(length(p) == length(y))
+  stopifnot(all(y %in% c(0, 1)))
+
+  # Remove NAs
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]
+  y <- y[ok]
+
+  # Sort by decreasing probability
+  o <- order(p, decreasing = TRUE)
+  p <- p[o]
+  y <- y[o]
+
+  P <- sum(y == 1)
+  N <- sum(y == 0)
+
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+
+  tpr <- tp / P
+  fpr <- fp / N
+
+  # Add origin
+  data.frame(
+    fpr = c(0, fpr),
+    tpr = c(0, tpr),
+    threshold = c(Inf, p)
+  )
+}
+
+roc_df <- roc_curve_df(p, y)
+
+#add ROC AUC (area under the curve) to the plot
+roc_auc_text <- sprintf("ROC AUC = %.3f", roc_auc(p, y))
+
+p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
+  geom_line(size = 1) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  #coord_equal() +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    title = "(b)"
+  ) +
+  annotate("text", x = 0.75, y = 0.125, label = roc_auc_text, 
+           color = "red", size = 4, fontface = "bold") +
+  theme_bw()
+
+p_roc
+```
+
+#PR Curve
+```{r}
+pr_curve_df <- function(p, y) {
+  stopifnot(length(p) == length(y))
+  stopifnot(all(y %in% c(0, 1)))
+
+  ok <- is.finite(p) & is.finite(y)
+  p <- p[ok]
+  y <- y[ok]
+
+  o <- order(p, decreasing = TRUE)
+  p <- p[o]
+  y <- y[o]
+
+  P <- sum(y == 1)
+
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+
+  recall <- tp / P
+  precision <- tp / (tp + fp)
+
+  # Add baseline point
+  data.frame(
+    recall = c(0, recall),
+    precision = c(mean(y), precision),
+    threshold = c(Inf, p)
+  )
+}
+
+pr_df <- pr_curve_df(p, y)
+
+#annotate thresholds
+annot_thresh <- c(1e-4, 5e-4, 1e-3, 2e-3)
+#find closest rows to these thresholds
+ann_df <- lapply(annot_thresh, function(t) {
+  pr_df %>%
+    mutate(diff = abs(threshold - t)) %>%
+    slice_min(diff, n = 1)
+}) %>%
+  bind_rows() %>%
+  mutate(label = paste0("t=", sprintf("%.6f", threshold)))
+
+pr_auc_text <- sprintf("PR AUC = %.5f", pr_auc(p, y))
+
+p_pr <- ggplot(pr_df, aes(recall, precision)) +
+  geom_line(size = 1, color = "black") +
+  geom_hline(yintercept = mean(y), linetype = "dashed", color = "grey50") +
+
+  # # annotation points
+  # geom_point(data = ann_df,
+  #            aes(recall, precision),
+  #            color = "red", size = 3) +
+
+  # geom_label(data = ann_df,
+  #          aes(recall, precision, label = label),
+  #          hjust = -0.1,
+  #          vjust = 0,
+  #          size = 3,
+  #          fill = "white",
+  #          label.size = 0) +
+
+  labs(
+    x = "Recall",
+    y = "Precision",
+    title = "(c)"
+  ) +
+
+  annotate("text", x = 0.8, y = 0.0006,
+           label = pr_auc_text,
+           color = "red", size = 4, fontface = "bold") +
+
+  theme_bw()
+
+p_pr
+
+
+
+```
+
+
+#Reliability curve with quantile binning
+(without quantile binning, all probabilities are in the first bin)
+```{r}
+reliability_curve_quantile <- function(p, y, nbins = 10) {
+  dat <- .clean_xy(p, y)
+  p <- dat$p; y <- dat$y
+  
+  # quantile-based breaks (to avoid empty bins) - based on the quantiles of predictions
+  probs  <- seq(0, 1, length.out = nbins + 1)
+  breaks <- quantile(p, probs = probs, na.rm = TRUE) 
+  breaks <- unique(breaks)  # in case of ties
+  
+  df <- data.frame(p = p, y = y) %>%
+    mutate(bin = cut(p, breaks = breaks, include.lowest = TRUE)) %>%
+    group_by(bin) %>%
+    summarise(
+      n          = n(),
+      mean_pred  = mean(p),
+      event_rate = mean(y),
+      .groups    = "drop"
+    )
+  
+  # extract numeric bounds
+  df$bin_lower <- as.numeric(sub("\\((.+),.*", "\\1", sub("\\[", "(", df$bin)))
+  df$bin_upper <- as.numeric(sub(".*,(.+)\\]", "\\1", sub("\\)", "]", df$bin)))
+  df$bin_mid   <- (df$bin_lower + df$bin_upper) / 2
+  
+  df %>%
+    dplyr::select(bin_lower, bin_upper, bin_mid, n, mean_pred, event_rate)
+}
+
+rel_tab <- reliability_curve_quantile(p, y, nbins = 10)
+rel_tab
+
+p_rel <- ggplot(rel_tab, aes(x = mean_pred, y = event_rate)) +
+  geom_point(shape = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  xlab("Mean predicted probability") +
+  ylab("Observed event frequency") +
+  ggtitle("(a)") +
+  ylim(0, 0.0007) +
+  xlim(0, 0.0007) +
+  theme_bw() 
+
+p_rel
+
+# rel_tab <- mutate(rel_tab, n_pred = n*mean_pred, n_event = n*event_rate)
+# 
+# p_rel <- ggplot(rel_tab, aes(x = n_pred, y = n_event)) +
+#   geom_point(shape = 1) +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+#   xlab("Summed predicted probability") +
+#   ylab("Summed observed event frequency") +
+#   ggtitle("(c)") +
+#   ylim(0, 270) +
+#   xlim(0, 270) +
+#   theme_bw() 
+# 
+# p_rel
+```
+
+
+```{r}
+blank_plot <- ggplot() + theme_void()
+
+grid.arrange(p_roc, p_pr, p_rel, blank_plot, nrow=2, ncol=2, heights=c(1,1), widths=c(1, 1))
+
+layout <- rbind(c(1, 2), 
+                c(3, 3))
+
+
+grid.arrange(p_rel, p_roc, p_pr, layout_matrix = layout)
+
+p <- grid.arrange(p_rel, p_roc, p_pr, layout_matrix = layout)
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_4.png"), plot = p, width = 9, height = 9, dpi = 1100, units = "in")
+```
+

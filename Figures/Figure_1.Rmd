@@ -1,0 +1,482 @@
+---
+title: "Figure 1"
+author: "Charlotte Uden"
+date: "2026-02-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(arrow)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths 
+```
+
+#Read in drivers for P_ignite - this csv contains daily summaries of each predictor variable
+```{r}
+drivers_file_path <- file.path(drivers_root, "drivers_predictions_and_observations_2002-2011.csv")
+df <- read.csv(drivers_file_path)
+head(df)
+```
+
+#Alaska polygon
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+```
+
+
+```{r}
+summary_df <- df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    temperature = mean(temperature),
+    precipitation = mean(precipitation),
+    wind = mean(wind),
+    relative_humidity = mean(relative_humidity),
+    FFMC = mean(FFMC),
+    DMC = mean(DMC),
+    DC = mean(DC),
+    C = mean(C),
+    B = mean(B),
+    U = mean(U),
+    .groups = "drop") 
+
+#global min and max land cover 
+min_value_land <- min(c(summary_df$C, summary_df$B, summary_df$U), na.rm = TRUE)
+max_value_land <- max(c(summary_df$C, summary_df$B, summary_df$U), na.rm = TRUE)
+```
+
+```{r}
+p_temp <- ggplot(summary_df, aes(x = lon, y = lat, fill = temperature)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Temperature ("*degree*"C)"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(c)")
+
+p_temp
+```
+
+```{r}
+p_precip <- ggplot(summary_df, aes(x = lon, y = lat, fill = precipitation)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Precipitation (m)"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(d)")
+
+p_precip
+```
+
+
+```{r}
+p_wind <- ggplot(summary_df, aes(x = lon, y = lat, fill = wind)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Wind (m/s)"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(e)")
+
+p_wind
+```
+
+```{r}
+p_rh <- ggplot(summary_df, aes(x = lon, y = lat, fill = relative_humidity)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Relative Humidity (%)"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(f)")
+
+p_rh
+```
+
+
+```{r}
+p_FFMC <- ggplot(summary_df, aes(x = lon, y = lat, fill = FFMC)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("FFMC"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(g)")
+
+p_FFMC
+```
+
+```{r}
+p_DMC <- ggplot(summary_df, aes(x = lon, y = lat, fill = DMC)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("DMC"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(h)")
+
+p_DMC
+```
+
+```{r}
+p_DC <- ggplot(summary_df, aes(x = lon, y = lat, fill = DC)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("DC"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(i)")
+
+p_DC
+```
+
+```{r}
+p_C <- ggplot(summary_df, aes(x = lon, y = lat, fill = C)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    limits = c(min_value_land, max_value_land), 
+    name = expression("% Conifer"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(j)")
+
+p_C
+```
+
+
+```{r}
+p_B <- ggplot(summary_df, aes(x = lon, y = lat, fill = B)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    limits = c(min_value_land, max_value_land), 
+    name = expression("% Broadleaf"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(k)")
+
+p_B
+```
+
+
+```{r}
+p_U <- ggplot(summary_df, aes(x = lon, y = lat, fill = U)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    limits = c(min_value_land, max_value_land), 
+    name = expression("% Openland/Unvegetated"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(l)")
+
+p_U
+```
+
+#Read in drivers for r_strike
+```{r}
+seasonal_df <- read_parquet(file.path(drivers_root, "lightning_prediction_drivers_2002_2011.csv"))
+head(seasonal_df)
+```
+
+```{r}
+summary_df_2 <- seasonal_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    swr = mean(swr),
+    sp = mean(sp),
+    .groups = "drop") 
+```
+
+```{r}
+p_swr <- ggplot(summary_df_2, aes(x = lon, y = lat, fill = swr)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Shortwave Radiation (W/m"^2*")"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(a)")
+
+p_swr
+```
+
+```{r}
+p_sp <- ggplot(summary_df_2, aes(x = lon, y = lat, fill = sp)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "viridis", 
+    #direction = -1,
+    name = expression("Surface Pressure (Pa)"),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
+    legend.position = c(0.6, 0.15)) +
+  ggtitle("(b)")
+
+p_sp
+```
+
+```{r}
+p <- grid.arrange(p_swr, p_sp, p_temp, 
+                  p_precip, p_wind, p_rh, 
+                  p_FFMC, p_DMC, p_DC, 
+                  p_C, p_B, p_U, ncol=3)
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_1.png"), plot = p, width = 15, height = 20, dpi = 1100, units = "in")
+```
+
