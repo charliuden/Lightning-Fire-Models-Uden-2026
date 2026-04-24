@@ -1,24 +1,26 @@
 ---
-title: "Figure_2"
+title: "Figure 3"
 author: "Charlotte Uden"
-date: "2026-01-23"
+date: "2026-04-20"
 output: html_document
 ---
 
+Reviewer comment:
+
+The model(s) were fit and tested for 2002-2011 and 2012-2018. This makes sense from the standpoint of the sensor changes as described, however the results don’t mention any evaluation of RMSE, etc. outside of the fitting period so it’s hard to judge the efficacy of the results. Given the limited lightning data in Alaska, one solution could be to produce some evaluation statistics for the period not used in the fitting (i.e. model fit for 2002-2011 is evaluated also against the 2012-2018 period). Earlier lightning observations are also available starting in the early 1990s that could be helpful as another independent test set.
+
+Our Response:
+We agree that applying parameter estimates outside the fitting period would strengthen our assessment of model generalizability. We have taken your suggestion and, for the ‘best’ lightning and ignition models, applied parameters from each period to data from the alternate period to check for out-of-period performance. We calculated performance metrics from these new predictions and added them to Figures 2 and 3 for clear in-period and out-of-period comparison. Finally, we added sections 3.1.4 and 3.2.5, “Cross validation across time periods,” to the results section. 
+
+Figure 3. Performance of lightning prediction models across predictor groups, modeling approaches, and training periods. Panels show six evaluation metrics: (a) normalized root mean square error (nRMSE), (b) correlation between observed and predicted values, (c) Skill score [55], (d) spatial correlation, (e) anomaly correlation coefficient (ACC), and (f) nRMSE of anomalies. Points represent metric estimates with horizontal bars indicating 95% bootstrap confidence intervals. Predictor groups are arranged on the y-axis, with model approach represented by point color (linear model=green, Gamma GLM=orange, Gamma Bayesian=purple) and training period represented by point shape (2002-2011=circle, 2012-2018=triangle). Each panel is divided into two sections: the upper facet (out-of-period test) shows performance of the near-surface Gamma GLM  when parameters estimated from one period are applied to data from the alternate period, while the lower facet (in-period test) shows performance evaluated on a held-out 20% test set from the same period used for training. In panels (a) and (f) values on the x-axis are reversed so that better performance appears on the right (allowing consistent interpretation across all plots).
+
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-```{r}
+library(tidyverse)
 library(scales)
-library(ggplot2)
-library(dplyr)
-library(gridExtra)
-library(scales)
-library(stringr)
-
+library(cowplot)
+library(ggpubr)
 ```
-
 
 Load configuration files
 - location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
@@ -47,261 +49,219 @@ figure_root <- config[["figure_root"]]
 ```
 
 ```{r}
-df <- read.csv(file.path(table_root, "ignition_efficiency_model_performance.csv"))
-
-# Define the desired order
-desired_order <- c("climate", "fuel moisture", "vegetation", "climate & fuel moisture", "climate & vegetation", "fuel moisture & vegetation", "climate, fuel moisture & vegetation")
-
-df <- df %>%
-  dplyr::mutate(
-    predictors    = factor(predictors, levels = desired_order),
-    approach      = factor(approach, levels = c("glmnet", "Bayesian")),
-    training_years = factor(training_years, levels = c("2001-2012", "2012-2018"))
-  )
+performance_df <- read.csv(file.path(table_root, "lightning_model_performance_time_transfer_test.csv"))
 ```
 
-
-
 ```{r}
-# A base theme for a clean, publication-style look
+
+# ── 1. Data preparation ───────────────────────────────────────────────────────
+
+desired_order <- c("CAPE", "CAPE x Pr", "RH + Rsds + T + Ps + Pr + U10")
+
+df_inperiod <- performance_df %>%
+  filter(input == "test data") %>%
+  mutate(
+    training_period = if_else(training_period == "2001-2012", "2002-2011", training_period),
+    facet_group = "In-period",
+    y_label     = predictors
+  )
+
+df_transfer <- performance_df %>%
+  filter(input != "test data") %>%
+  mutate(
+    facet_group = "Out-of-period",
+    y_label     = paste0(training_period, " \u2192 ", input)
+  )
+
+df_plot <- bind_rows(df_inperiod, df_transfer) %>%
+  mutate(
+    facet_group = factor(facet_group,
+                         levels = c("Out-of-period", "In-period")),
+    y_label = factor(y_label,
+                     levels = c("2012-2018 \u2192 2002-2011",
+                                "2002-2011 \u2192 2012-2018",
+                                desired_order)),
+    model           = factor(model, levels = c("LM", "Gamma GLM", "Gamma Bayesian")),
+    training_period = factor(training_period, levels = c("2002-2011", "2012-2018"))
+  )
+
+# ── 2. Shared aesthetics ──────────────────────────────────────────────────────
+
+color_vals <- c("LM" = "#0C7BDC", "Gamma GLM" = "purple4", "Gamma Bayesian" = "orange")
+shape_vals <- c("2002-2011" = 16, "2012-2018" = 17)
+dodge      <- position_dodge(width = 0.6)
+
+# Base theme — no facet strips (strips removed from all panels by default)
 base_theme <- theme_bw(base_size = 11) +
   theme(
-    #panel.grid.major.y = element_blank(),
-    #panel.grid.minor   = element_blank(),
-    axis.title.y       = element_blank(),
-    legend.position    = "bottom",
-    legend.box         = "vertical",
-    legend.title       = element_text(size = 10),
-    legend.text        = element_text(size = 9)
+    axis.title.y      = element_blank(),
+    legend.position   = "none",
+    strip.background  = element_blank(),
+    strip.text        = element_blank(),   # hide facet labels everywhere by default
+    axis.text.x       = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin       = ggplot2::margin(t = 10, r = 10, b = 10, l = 30)
   )
 
-# ------------------ AUC PANEL ------------------ #
-p_auc <- ggplot(df,
-                aes(x = AUC, y = predictors,
-                    color = approach,
-                    shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9,
-                 position = position_dodge(width = 0.6)) +
-  # --- confidence intervals ---
-  geom_errorbarh(aes(xmin = AUC_CI_low,
-                     xmax = AUC_CI_high),
-                 height = 0.25,
-                 alpha = 0.6,
-                 linewidth = 0.5,
-                 position = position_dodge(width = 0.6)) +
-  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey70") +
-  scale_x_continuous(
-    limits = c(0.4, 1.0),
-    breaks = seq(0.4, 1.0, by = 0.1),
-    labels = label_number(accuracy = 0.01)
-  ) +
-  scale_y_discrete(labels = function(x) str_wrap(x, width = 25)) +
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "ROC AUC",
-    y = NULL,
-    color = "Approach",
-    shape = "Training period"
-  ) +
-  ggtitle("(a)") +
-  base_theme +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
-  theme(legend.position = "none")
+# Theme variant for plot (a): show vertical facet labels on the right
+theme_with_strips <- base_theme +
+  theme(
+    strip.text.y      = element_text(size = 7, face = NULL,
+                                     angle = 90,   # vertical text
+                                     margin = margin(l = 4, r = 4)),
+    strip.background  = element_rect(fill = "white", color = "grey70"),
+    strip.placement   = "outside"   # place strips outside the axis
+  )
 
-# ------------------ PR AUC PANEL ------------------ #
-p_pr_auc <- ggplot(df,
-                aes(x = PR_AUC, y = predictors,
-                    color = approach,
-                    shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9,
-                 position = position_dodge(width = 0.6)) +
-  # --- confidence intervals ---
-  geom_errorbarh(aes(xmin = PR_AUC_CI_low,
-                     xmax = PR_AUC_CI_high),
-                 height = 0.25,
-                 alpha = 0.6,
-                 linewidth = 0.5,
-                 position = position_dodge(width = 0.6)) +
-  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey70") +
-  scale_x_continuous(
-    limits = c(0.2, 1.0),
-    breaks = seq(0.2, 1.0, by = 0.1),
-    labels = label_number(accuracy = 0.01)
-  ) +
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "PR AUC",
-    y = NULL,
-    color = "Approach",
-    shape = "Training period"
-  ) +
-  ggtitle("(b)") +
-  base_theme +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-        plot.margin=ggplot2::margin(t = 10, r =30, b = 10, l = 10)) +
-  scale_y_discrete(position = "right",
-                   labels = function(x) str_wrap(x, width = 25)) +
-  theme(legend.position = "none")
+# Helper: add facet + scales (no strip labels)
+add_facet_scales <- function(p, show_strips = FALSE, right_axis = FALSE) {
+  p2 <- p +
+    facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+    scale_color_manual(values = color_vals, name = "Approach") +
+    scale_shape_manual(values = shape_vals,  name = "Training period")
 
-# ------------------ BRIER PANEL ------------------ #
-p_brier <- ggplot(df,
-                  aes(x = Brier, y = predictors,
-                      color = approach,
-                      shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9,
-                 position = position_dodge(width = 0.6)) +
-  # --- confidence intervals ---
-  geom_errorbarh(aes(xmin = Brier_CI_low,
-                     xmax = Brier_CI_high),
-                 height = 0.25,
-                 alpha = 0.6,
-                 linewidth = 0.5,
-                 position = position_dodge(width = 0.6)) +
-  scale_x_reverse(
-    breaks = seq(0.43, 0.13, by = -0.02),
-    labels = label_number(accuracy = 0.01)
-  ) +
-  scale_y_discrete(labels = function(x) str_wrap(x, width = 25)) +
-  coord_cartesian(xlim = c(0.43, 0.13)) +
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "Brier Score",
-    y = NULL,
-    color = "Approach",
-    shape = "Training period"
-  ) +
-  ggtitle("(c)") +
-  base_theme +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
-  theme(legend.position = "none")
+  if (right_axis) {
+    p2 <- p2 +
+      scale_y_discrete(position = "right",
+                       labels = function(x) str_wrap(x, width = 18))
+  } else {
+    p2 <- p2 +
+      scale_y_discrete(labels = function(x) str_wrap(x, width = 18))
+  }
 
-# ------------------ CALIBRATION INTERCEPT ------------------ #
-p_calib_intercept <- ggplot(df,
-                  aes(x = calib_intercept, y = predictors,
-                      color = approach,
-                      shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9,
-                 position = position_dodge(width = 0.6)) +
-  # --- confidence intervals ---
-  geom_errorbarh(aes(xmin = calib_intercept_CI_low,
-                     xmax = calib_intercept_CI_high),
-                 height = 0.25,
-                 alpha = 0.6,
-                 linewidth = 0.5,
-                 position = position_dodge(width = 0.6)) +
-  scale_x_continuous(
-    breaks = seq(-2, 30, by = 1),
-    labels = label_number(accuracy = 1)
-  ) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") + #if intercept = 0, no bias
-  coord_cartesian(xlim = c(-2, 14)) + 
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "Calibration Intercept",
-    y = NULL,
-    color = "Approach",
-    shape = "Training period"
-  ) +
-  ggtitle("(d)") +
-  base_theme +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-        plot.margin=ggplot2::margin(t = 10, r =30, b = 10, l = 10)) +
-  scale_y_discrete(position = "right",
-                   labels = function(x) str_wrap(x, width = 25)) +
-  theme(legend.position = "none")
-
-# ------------------ CALIBRATION SLOPE ------------------ #
-p_calib_slope <- ggplot(df,
-                  aes(x = calib_slope, y = predictors,
-                      color = approach,
-                      shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9,
-                 position = position_dodge(width = 0.6)) +
-  # --- confidence intervals ---
-  geom_errorbarh(aes(xmin = calib_slope_CI_low,
-                     xmax = calib_slope_CI_high),
-                 height = 0.25,
-                 alpha = 0.6,
-                 linewidth = 0.5,
-                 position = position_dodge(width = 0.6)) +
-  scale_x_continuous(
-    breaks = seq(-5, 111, by = 1),
-    labels = label_number(accuracy = 1)
-  ) +
-  scale_y_discrete(labels = function(x) str_wrap(x, width = 25)) +
-  #scale_y_discrete(labels = label_wrap(width = 40)) + 
-  geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") + #if slope = 1, perfect calibration
-  coord_cartesian(xlim = c(-4, 15)) + 
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "Calibration Slope",
-    y = NULL,
-    color = "Approach",
-    shape = "Training period"
-  ) +
-  ggtitle("(e)") +
-  base_theme +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
-        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
-  theme(legend.position = "none")
-
-# ------------------ COMBINE PANELS ------------------ #
-
-# Extract the legend
-#----
-# Function to extract the legend from a ggplot object
-extract_legend <- function(my_plot) {
-  g <- ggplotGrob(my_plot)  # Convert plot to grob
-  legend <- g$grobs[which(sapply(g$grobs, function(x) x$name) == "guide-box")][[1]]
-  return(legend)  # Returns the legend as a grob
+  if (show_strips) {
+    p2 + theme_with_strips
+  } else {
+    p2 + base_theme
+  }
 }
 
-legend_plot <- ggplot(df,
-                  aes(x = calib_slope, y = predictors,
-                      color = approach,
-                      shape = training_years)) +
-  geom_point(size = 2.8, alpha = 0.9) +
-  scale_x_continuous(
-    limits = c(-4, 111),
-    breaks = seq(-4, 111, by = 2),
-    labels = label_number(accuracy = 1)
-  ) +
-  geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") +
-  scale_color_brewer(palette = "Dark2") +
-  labs(
-    x = "Calibration Slope",
-    y = NULL,
-    color = "Approach",
-    shape = "Years"
-  ) +
-  ggtitle("(e)") +
-  base_theme +
+# Helper: points + error bars
+pts_eb <- function(xvar, xmin_var, xmax_var) {
+  list(
+    geom_point(aes(x = .data[[xvar]]),
+               size = 2.8, alpha = 0.9, position = dodge),
+    geom_errorbarh(aes(xmin = .data[[xmin_var]], xmax = .data[[xmax_var]]),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge)
+  )
+}
+
+# ── 3. Individual panels ──────────────────────────────────────────────────────
+
+# (a) nRMSE — reversed axis, strip labels ON, left y-axis
+p_nrmse <- add_facet_scales(show_strips = TRUE, right_axis = FALSE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("nrmse", "nrmse_ci_low", "nrmse_ci_high") +
+    scale_x_reverse(breaks = seq(0, 14, by = 1),
+                    labels = label_number(accuracy = 1),
+                    limits = c(14, 0)) +
+    labs(x = "nRMSE") +
+    ggtitle("(a)")
+)
+
+# (b) Correlation — no strips, RIGHT y-axis
+p_cor <- add_facet_scales(show_strips = FALSE, right_axis = TRUE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("cor", "cor_ci_low", "cor_ci_high") +
+    scale_x_continuous(breaks = seq(-0.1, 0.7, by = 0.2),
+                       limits = c(-0.15, 0.7)) +
+    labs(x = "Correlation") +
+    ggtitle("(b)") +
+    theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+)
+
+# (c) S-score — no strips, left y-axis
+p_sscore <- add_facet_scales(show_strips = FALSE, right_axis = FALSE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("sscore", "sscore_ci_low", "sscore_ci_high") +
+    scale_x_continuous(breaks = seq(0.5, 1.0, by = 0.1),
+                       limits = c(0.5, 1.02)) +
+    labs(x = "S-score") +
+    ggtitle("(c)")
+)
+
+# (d) Spatial correlation — no strips, RIGHT y-axis
+p_spcor <- add_facet_scales(show_strips = FALSE, right_axis = TRUE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("spcor", "spcor_ci_low", "spcor_ci_high") +
+    scale_x_continuous(breaks = seq(0.0, 0.7, by = 0.1),
+                       limits = c(-0.05, 0.72)) +
+    labs(x = "Spatial Correlation") +
+    ggtitle("(d)") +
+    theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+)
+
+# (e) ACC — no strips, left y-axis
+p_acc <- add_facet_scales(show_strips = FALSE, right_axis = FALSE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("acc", "acc_ci_low", "acc_ci_high") +
+    scale_x_continuous(breaks = seq(-1.0, 1.0, by = 0.2),
+                       labels = label_number(accuracy = 0.1),
+                       limits = c(-1.05, 1.0)) +
+    labs(x = "ACC") +
+    ggtitle("(e)")
+)
+
+# (f) nRMSE of anomalies — reversed axis, no strips, RIGHT y-axis
+p_nrmseA <- add_facet_scales(show_strips = FALSE, right_axis = TRUE,
+  p = ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("nrmseA", "nrmseA_ci_low", "nrmseA_ci_high") +
+    scale_x_reverse(breaks = seq(0, 5, by = 0.5),
+                    labels = label_number(accuracy = 0.1),
+                    limits = c(5, 0)) +
+    labs(x = "nRMSE of Anomalies") +
+    ggtitle("(f)") +
+    theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+)
+
+# ── 4. Shared horizontal legend ───────────────────────────────────────────────
+
+legend_plot <- ggplot(df_plot,
+                      aes(x = nrmse, y = y_label,
+                          color = model, shape = training_period)) +
+  geom_point(size = 2.8) +
+  scale_color_manual(values = color_vals, name = "Approach") +
+  scale_shape_manual(values = shape_vals,  name = "Years") +
+  theme_void() +
   theme(
-    legend.box = "horizontal",
-    legend.text = element_text(size = 10),
-    legend.key.height = unit(0.5, "cm"), # Add a small height back
-    legend.key.width = unit(1.5, "cm"),  # Slightly reduced width
-    legend.spacing.x = unit(0.5, "cm")
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    legend.title     = element_text(size = 10),
+    legend.text      = element_text(size = 9),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.0, "cm"),
+    legend.spacing.x  = unit(2, "cm")
   ) +
   guides(
-    color = guide_legend(ncol = 3),
-    shape = guide_legend(ncol = 3) 
+    color = guide_legend(nrow = 1),
+    shape = guide_legend(nrow = 1)
   )
 
-#----
+#shared_legend <- get_legend(legend_plot)
+shared_legend <- ggpubr::get_legend(legend_plot)
 
-legend_grob <- extract_legend(legend_plot)
+# ── 5. Assemble final figure ──────────────────────────────────────────────────
 
-blank_plot <- ggplot() + theme_void()
+fig_panels <- plot_grid(
+  p_nrmse, p_cor,
+  p_sscore, p_spcor,
+  p_acc,   p_nrmseA,
+  ncol = 2,
+  align = "h"    # "hv" can fail with scale_x_reverse; use "h"
+)
 
-p <- grid.arrange(p_auc,p_pr_auc,p_brier,p_calib_intercept,p_calib_slope,blank_plot, legend_grob, nrow=4, ncol=2, heights=c(1,1,1,0.2), widths=c(1, 1), layout_matrix=rbind(c(1, 2), c(3, 4), c(5, 6), c(7,7)))
+final_fig <- plot_grid(
+  fig_panels,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
 
+final_fig
+
+ggsave(file.path(figure_root, "Figure_3.2.png"),
+       plot = final_fig, width = 10, height = 9, dpi = 1100, units = "in")
 ```
 
 
-```{r}
-ggsave(file.path(figure_root, "Figure_3.png"), plot = p, width = 10, height = 9, dpi = 1100, units = "in")
-```
 

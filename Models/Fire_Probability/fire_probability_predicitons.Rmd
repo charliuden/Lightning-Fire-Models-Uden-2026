@@ -28,7 +28,6 @@ library(ggspatial)
 library(viridis)
 library(rlang)  
 library(data.table)
-
 ```
 
 Load configuration files

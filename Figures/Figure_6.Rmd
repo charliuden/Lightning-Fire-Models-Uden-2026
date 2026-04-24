@@ -5,28 +5,14 @@ date: "2026-01-30"
 output: html_document
 ---
 
-Figure 6. Mapped predictions and observations of lightning strike rates, lightning ignition efficiency, and fire occurrence in Alaska, June-August 2002-2011. Predictions of lightning strike rates, ignition probability, and fire probability come from ERA5 climate and fuel moisture data, and NALCMS land cover data during the ten year period. Observed lightning strike rates are calculated from data collected by the Alaska Lightning Detection Network. Observed ignition rates are calculated as the number of strikes that caused a fire divided by the total number of strikes during the study period. Observed fire rates are calculated as the number of fire days divided by the total number of days. 
+Figure 6. Interannual variability of observed fire frequency and simulated fire probability in Alaska, 2002-2011. Yellow circles show annual mean observed fire rate (number of fire days/total number of days) with error bars representing 95% binomial confidence intervals around the annual mean fire occurrence. Blue triangles show annual mean predicted fire probability with error bars representing bootstrap 95% confidence interval of the annual mean, via resampling cells with replacement. The dotted horizontal line marks the ten-year observed mean lightning-caused fire rate (0.00067) and provides a reference for interannual anomalies. 
+
 
 ```{r}
 library(tidyr)
 library(patchwork)
 library(dplyr)
 library(ggplot2)
-library(gridExtra)
-library(terra)
-library(lubridate)
-library(rnaturalearth)
-library(rnaturalearthdata)
-library(sf)
-```
-
-Alaska polygon
-```{r}
-# Get USA polygon
-usa <- ne_states(country = "United States of America", returnclass = "sf")
-# Filter to Alaska only
-alaska <- usa[usa$name == "Alaska", ]
-alaska <- st_transform(alaska, crs = 4326)
 ```
 
 Load configuration files
@@ -51,297 +37,179 @@ rds_root <- config[["rds_root"]]
 table_root <- config[["table_root"]]
 predictions_root <- config[["predictions_root"]]
 figure_root <- config[["figure_root"]]
-data_root <- config[["data_root"]]
 
 # Use the values to build full paths 
 ```
 
-
-#Read in calculations of observed lightning strike rate
 ```{r}
-df_strikes <- read.csv(file.path(drivers_root, "lightning_prediction_drivers_2002_2011.csv"))[,2:13]
-
-obs_strike <- df_strikes %>% dplyr::select(year,lon,lat,summer_monthly_strike_rate)
-
-summary_obs_strike <- obs_strike %>%
-  group_by(lat, lon) %>%
-  summarise(
-    obs_r_strike = mean(summer_monthly_strike_rate),
-    .groups = "drop")
+df <- read.csv(file.path(predictions_root, "drivers_predictions_and_observations_2001-2012_10x.csv"))
 ```
 
+#Bars for observed fire rate:
 
-#Read in observations of fire occurance and predictions of r_strike, P_ignite, and P_fire
-```{r}
-df <- read.csv(file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv"))
-```
+Use a binomial standard error / confidence interval instead of standard deviation. For each year, compute:
+mu = mean(fire)
+SE = sqrt(mu*(1-mu)/n)
+error bar = mu +- 1.96*SE
+This gives uncertainty on the mean rate, not spread among daily 0/1 values. 
 
-#Calculate:
-Mean predicted strike rate
-Mean predicted ignition efficiency
-Mean predicted fire probability
-Mean observed fire rate (= #fire days / total # of days)
 ```{r}
+
 summary_df <- df %>%
-  group_by(lat, lon) %>%
+  group_by(year) %>%
   summarise(
-    r_strike = mean(r_strike),
-    P_ignite = mean(P_ignite_prob),
-    fire_freq = mean(fire),
-    n_fire = sum(fire), 
-    P_fire = mean(i.P_fire),
-    .groups = "drop")
+    mean_fire   = mean(fire, na.rm = TRUE),
+    n           = sum(is.finite(fire)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se_fire = sqrt(mean_fire * (1 - mean_fire) / n),
+    lo_fire = pmax(0, mean_fire - 1.96 * se_fire),
+    hi_fire = pmin(1, mean_fire + 1.96 * se_fire),
+  )
 
-#merge observed strike rate with summary df
-summary_df <- merge(summary_df, summary_obs_strike, by=c("lat","lon"))
 
-```
-
-Get total number of strikes per gridcell for the study period (2001-2011)
-monthly strike sums are calculated during preprocessing. See: /Lightning-Fire-Models-Uden-2026/Data_preprocessing/Lightning/3_lightning_era5climate_monthly_summaries.R
-```{r}
-#read in observed monthly strike count data
-df_strikes_monthly <- read.csv(fil.path(data_root, "Alaska_era5_lightning_monthly_summaries_2001_2012.csv"))[,2:14]
-df_strikes_monthly <- df_strikes_monthly %>% dplyr::select(year, month, lon, lat, strikes_monthly_sum)
-
-#sum strikes
-summary_obs_strike_sum <- df_strikes_monthly %>%
-  group_by(lat, lon) %>%
-  summarise(
-    n_strikes = sum(strikes_monthly_sum))
-
-#merge observed strike count with summary df
-summary_df <- merge(summary_df, summary_obs_strike_sum, by=c("lat","lon"))
 
 ```
-Calculate observed ignition event rate: the rate of lightning strikes that cause a fire (#fires/#strikes), per gridcell, across the entire study period (2001-2011)
+
+#Bars for predicted fire probability:
+
+Bootstrap uncertainty of the annual mean predicted probability of fire. For each year, mean_pred = mean (P_fire) over all gridcell-days
+lo, high = bootsrap 95% CI of the annual mean, via resampling cells with replacement
+
 ```{r}
-summary_df <- summary_df %>%
-  mutate(obs_ignite = n_fire/n_strikes) %>%
-  mutate(obs_ignite = replace_na(obs_ignite, 0))
+bootstrap_annual_mean_pred <- function(df, p_col = "P_fire", year_col = "year",
+                                       cluster_col = "cell_id",
+                                       B = 1000, conf = 0.95, seed = 1) {
+  stopifnot(all(c(p_col, year_col, cluster_col) %in% names(df)))
+
+  # Keep only needed columns, drop NAs
+  d <- df[, c(year_col, cluster_col, p_col)]
+  d <- d[is.finite(d[[p_col]]) & is.finite(d[[year_col]]), , drop = FALSE]
+
+  # Use data.table for speed/memory
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Please install data.table for this function: install.packages('data.table')")
+  }
+  dt <- data.table::as.data.table(d)
+  data.table::setnames(dt, c(year_col, cluster_col, p_col), c("year", "cluster", "p"))
+
+  # Precompute row indices for each (year, cluster)
+  idx_by_cluster <- dt[, .(idx = list(.I)), by = .(year, cluster)]
+
+  # For each year, store: unique clusters + list of indices per cluster
+  years <- sort(unique(idx_by_cluster$year))
+  alpha <- (1 - conf) / 2
+
+  set.seed(seed)
+
+  out <- lapply(years, function(yy) {
+    sub <- idx_by_cluster[year == yy]
+    clusters <- sub$cluster
+    idx_list <- sub$idx
+    K <- length(clusters)
+
+    # Point estimate (no resampling)
+    mean_pred <- mean(dt[year == yy, p])
+
+    # Bootstrap
+    boot_means <- numeric(B)
+    for (b in seq_len(B)) {
+      # resample clusters with replacement
+      samp <- sample.int(K, size = K, replace = TRUE)
+
+      # concatenate row indices for sampled clusters
+      idx <- unlist(idx_list[samp], use.names = FALSE)
+
+      boot_means[b] <- mean(dt$p[idx])
+    }
+
+    qs <- stats::quantile(boot_means, probs = c(alpha, 1 - alpha), names = FALSE, type = 7)
+
+    data.frame(
+      year = yy,
+      mean_pred = mean_pred,
+      lo_pred = qs[1],
+      hi_pred = qs[2]
+    )
+  })
+
+  out <- do.call(rbind, out)
+  out
+}
+
+pred_ci <- bootstrap_annual_mean_pred(df, p_col = "i.P_fire", cluster_col = "cell_id",
+                                      B = 1000, seed = 123)
+
+head(pred_ci)
 ```
 
-Get min and max values for color plotting
+#merge and convert to long format
 ```{r}
-#global min and max fire probabilities/frequencies
-min_value_fire <- min(c(summary_df$fire_freq, summary_df$P_fire), na.rm = TRUE)
-max_value_fire <- max(c(summary_df$fire_freq, summary_df$P_fire), na.rm = TRUE)
+summary_df <- merge(summary_df, pred_ci, by="year")
 
-#global min and max strike rates
-min_value_strike <- min(c(summary_df$obs_r_strike, summary_df$r_strike), na.rm = TRUE)
-max_value_strike <- max(c(summary_df$obs_r_strike, summary_df$r_strike), na.rm = TRUE)
-
-#global min and max ignition probabilities/frequencies
-min_value_ignite <- min(c(summary_df$obs_ignite, summary_df$P_ignite), na.rm = TRUE)
-max_value_ignite <- max(c(summary_df$obs_ignite, summary_df$P_ignite), na.rm = TRUE)
+summary_long <- summary_df %>%
+  transmute(
+    year,
+    series = "Observed fire rate",
+    mean   = mean_fire,
+    lo     = lo_fire,
+    hi     = hi_fire
+  ) %>%
+  bind_rows(
+    summary_df %>%
+      transmute(
+        year,
+        series = "Predicted fire probability",
+        mean   = mean_pred,
+        lo     = lo_pred,
+        hi     = hi_pred
+      )
+  )
 ```
 
-Make maps!
 
 ```{r}
-p_strike <- ggplot(summary_df, aes(x = lon, y = lat, fill = r_strike)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    limits = c(min_value_strike, max_value_strike), 
-    name = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2)),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(a)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
+pd <- position_dodge(width = 0.4)
+
+custom_grid_lines_x <- c(2002.5, 2003.5, 2004.5, 2005.5, 2006.5, 2007.5, 2008.5, 2009.5, 2010.5, 2011.5) 
+
+p <- ggplot(summary_long,
+            aes(x = year, y = mean, color = series, shape = series)) +
+  
+  geom_point(size = 3, position = pd) +
+  
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                width = 0.2, position = pd) +
+  
+  scale_color_manual(values = c("Observed fire rate" = "#FFC20A", "Predicted fire probability" = "#0C7BDC"),
+                     labels = c("Observed fire rate", "Predicted fire probability")) +
+  
+  geom_hline(yintercept = sum(df$fire)/nrow(df), linetype = "dotted", color = "black", linewidth = 0.5) +
+  
+  scale_x_continuous(breaks = summary_df$year) +
+  
+  theme_bw() +
+   geom_vline(xintercept = custom_grid_lines_x, color = "gray", linewidth = 0.1) +
+
   theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
-
-p_strike
-```
-
-
-```{r}
-p_strike_obs <- ggplot(summary_df, aes(x = lon, y = lat, fill = obs_r_strike)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    limits = c(min_value_strike, max_value_strike), 
-    name = expression(atop("Observed lightning strike rate", "strikes/month/km"^2)),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(d)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
-  theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
-
-p_strike_obs
-```
-
-```{r}
-p_ignite <- ggplot(summary_df, aes(x = lon, y = lat, fill = P_ignite)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    #limits = c(min_value_ignite, max_value_ignite), 
-    name = expression(Predicted~ignition~efficiency),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top")
+    panel.grid.major.x = element_blank(), # Remove default major vertical gridlines
+    panel.grid.minor.x = element_blank(), # Remove default minor vertical gridlines
+    panel.grid.major.y = element_line(color = "gray", linewidth = 0.1), # Keep/style horizontal gridlines
+    panel.grid.minor.y = element_blank()  # Remove minor horizontal gridlines if desired
   ) +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(b)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
-  theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  labs(x = "Year", y = "Fire probability / rate") +
+  
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.0001))
 
-p_ignite
-```
-
-```{r}
-p_ignite_obs <- ggplot(summary_df, aes(x = lon, y = lat, fill = obs_ignite)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    #limits = c(min_value_ignite, max_value_ignite), 
-    #name = expression(Observed~ignition~rate),
-    name = expression(atop("Observed ignition rate", "(fire count / strike count)")),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top")
-  ) +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(e)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
-  theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
-
-p_ignite_obs
+p
 ```
 
 
 ```{r}
-p_fire <- ggplot(summary_df, aes(x = lon, y = lat, fill = P_fire)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    limits = c(min_value_fire, max_value_fire), 
-    name = expression(Predicted~fire~probability),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top")
-  ) +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(c)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
-  theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
-
-p_fire
+ggsave(file.path(figure_root, "Figure_6.png"), plot = p, width = 8, height = 3, dpi = 1100, units = "in")
 ```
 
-```{r}
-p_obs_fire <- ggplot(summary_df, aes(x = lon, y = lat, fill = fire_freq)) +
-  geom_raster() +
-  xlim(-170, -130) +
-  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
-  scale_fill_viridis_c(
-    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
-    direction = -1,
-    limits = c(min_value_fire, max_value_fire), 
-    #name = expression(Observed~fire~rate),
-    name = expression(atop("Observed fire rate", "(fire days / total days)")),
-    guide = guide_colorbar(direction = "horizontal", title.position = "top")
-  ) +
-  xlab("Lon") +
-  ylab("Lat") +
-  ggtitle("(f)") +
-  theme_minimal() +
-  theme(legend.position="bottom") +
-  theme(
-    axis.title.x = element_text(size = 8),
-    axis.title.y = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
-    axis.text.x = element_text(size = 8),
-    legend.text = element_text(size = 8, angle = 45, hjust = 1),
-    legend.title = element_text(size = 8),
-    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
-    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
-    legend.background = element_rect(fill = "white", color = "white", size = 0.2),
-    legend.position = c(0.6, 0.15))
 
-p_obs_fire
-```
 
-```{r}
-blank_plot <- ggplot() + theme_void()
-
-p <- grid.arrange(p_strike, p_ignite, p_fire, ncol=1)
-
-p <- grid.arrange(p_strike, p_ignite, p_fire, p_obs_fire, ncol=1)
-
-p <- grid.arrange(p_strike, p_ignite, p_fire, p_strike_obs, p_ignite_obs, p_obs_fire, ncol=3)
-```
-
-```{r}
-ggsave(file.path(figure_root, "Figure_6.png"), plot = p, width = 15, height = 10, dpi = 1100, units = "in")
-```

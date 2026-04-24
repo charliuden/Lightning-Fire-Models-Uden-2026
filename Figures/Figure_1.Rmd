@@ -51,7 +51,7 @@ figure_root <- config[["figure_root"]]
 
 #Read in drivers for P_ignite - this csv contains daily summaries of each predictor variable
 ```{r}
-drivers_file_path <- file.path(drivers_root, "drivers_predictions_and_observations_2002-2011.csv")
+drivers_file_path <- file.path(drivers_root, "drivers_predictions_and_observations_2002-2011_10x.csv")
 df <- read.csv(drivers_file_path)
 head(df)
 ```

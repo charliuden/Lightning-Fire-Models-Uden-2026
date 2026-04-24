@@ -1,12 +1,14 @@
 ---
-54title: "Figure_7"
+title: "Figure_7"
 author: "Charlotte Uden"
-date: "2026-03-06"
+date: "2026-01-30"
 output: html_document
 ---
 
-```{r}
+Figure 7. Mapped predictions and observations of lightning strike rates, lightning ignition efficiency, and fire occurrence in Alaska, June-August 2002-2011. The top row contains model predictions of (a) lightning strike rates, (b) ignition probability, and (c) fire probability, estimated from ERA5 climate and fuel moisture data, and NALCMS land cover data and are summarized as the mean prediction per gridcell across the ten year period. The middle row contains summaries of observed data, including (d) mean lightning strike rate, (e) ignition rates (number of strikes that caused a fire / total number of strikes), and (f) fire rate (number of fire days / total number of days). Lightning and wildfire data come from the Alaska Lightning Detection Network and the Alaska-Yukon-Northwest Territories Fire Emissions Database. The bottom row contains per-gridcell calculations of mean bias for (g) lightning strike rate (seasonal predicted - observed strikes/km2/month) and (h) fire probability (daily predicted probability - observed 0/1 outcome). Purple gridcells indicate underprediction and orange gridcells indicate overprediction. Topographic lines downloaded using the geodata R package [56] are also displayed. 
 
+
+```{r}
 library(tidyr)
 library(patchwork)
 library(dplyr)
@@ -17,7 +19,6 @@ library(lubridate)
 library(rnaturalearth)
 library(rnaturalearthdata)
 library(sf)
-
 ```
 
 Load configuration files
@@ -46,741 +47,567 @@ figure_root <- config[["figure_root"]]
 # Use the values to build full paths 
 ```
 
+Alaska polygon
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+```
+
+#Read in calculations of observed lightning strike rate
+```{r}
+df_strikes <- read.csv(file.path(drivers_root, "lightning_prediction_drivers_2002_2011.csv"))[,2:13]
+
+obs_strike <- df_strikes %>% dplyr::select(year,lon,lat,summer_monthly_strike_rate)
+
+summary_obs_strike <- obs_strike %>%
+  group_by(lat, lon) %>%
+  summarise(
+    obs_r_strike = mean(summer_monthly_strike_rate),
+    .groups = "drop")
+```
+
+
 #Read in observations of fire occurance and predictions of r_strike, P_ignite, and P_fire
 ```{r}
-df <- read.csv(file.path(drivers_root, "drivers_predictions_and_observations_2002-2011_10x.csv"))
-str(df)
+df <- read.csv(file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv"))
 ```
 
-
-Function to preprocess data for plotting
+#Calculate:
+Mean predicted strike rate
+Mean predicted ignition efficiency
+Mean predicted fire probability
+Mean observed fire rate (= #fire days / total # of days)
 ```{r}
-plot_preprocess <- function(data, x_var, y_var, target_name, x_bins, y_bins, min_count) {
-  
-  # --- Clean + transform ---
-# Select only the necessary columns for this plot and transform
-  plot_df <- data %>%
-    dplyr::select(all_of(c(x_var, y_var, target_name))) %>%
-    mutate(across(everything(), as.numeric)) %>%
-    drop_na()
+summary_df <- df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    r_strike = mean(r_strike),
+    P_ignite = mean(P_ignite_prob),
+    fire_freq = mean(fire),
+    n_fire = sum(fire), 
+    P_fire = mean(i.P_fire),
+    .groups = "drop")
 
-# Add the log10 target column (floor to avoid -Inf for very small probabilities)
-  plot_df <- plot_df %>%
-    mutate(
-      !!log_target_col := log10(pmax(.data[[target_name]], 1e-15))
-      )
+#merge observed strike rate with summary df
+summary_df <- merge(summary_df, summary_obs_strike, by=c("lat","lon"))
 
-# --- Binning and Aggregation for the single heatmap ---
-
-# Calculate breaks for x_var (ie. temperature)
-  x_breaks <- quantile(plot_df[[x_var]], probs = seq(0, 1, length.out = x_bins + 1), na.rm = TRUE)
-  x_breaks <- unique(x_breaks) # Ensure breaks are unique
-  if (length(x_breaks) < 2) { # Fallback if not enough unique breaks
-    x_breaks <- pretty(plot_df[[x_var]], n = x_bins)
-    }
-
-# Calculate breaks for y_var (ie. precipitation)
-  y_breaks <- quantile(plot_df[[y_var]], probs = seq(0, 1, length.out = y_bins + 1), na.rm = TRUE)
-  y_breaks <- unique(y_breaks) # Ensure breaks are unique
-  if (length(y_breaks) < 2) { # Fallback if not enough unique breaks
-    y_breaks <- pretty(plot_df[[y_var]], n = y_bins)
-    }
-
-# Create bins and aggregate data
-  surf_df <- plot_df %>%
-    mutate(
-      x_bin = cut(.data[[x_var]], breaks = x_breaks, include.lowest = TRUE, labels = FALSE),
-      y_bin = cut(.data[[y_var]], breaks = y_breaks, include.lowest = TRUE, labels = FALSE)
-      ) %>%
-    group_by(x_bin, y_bin) %>%
-    summarise(
-      mean_target = mean(.data[[target_name]], na.rm = TRUE),
-      mean_log_target = mean(.data[[log_target_col]], na.rm = TRUE),#get mean of log column too
-      count = n(),
-      .groups = "drop"
-      ) %>%
-    filter(count >= min_count) %>% # Mask bins with too few samples
-    #mutate(count = ifelse(count < min_count, NA, count)) %>% #or make counts less than min_count NA
-    #filter(mean_target >= 0.00001) %>%
-    # Calculate bin midpoints for plotting
-    mutate(
-      xmid = (x_breaks[x_bin] + x_breaks[x_bin + 1]) / 2,
-      ymid = (y_breaks[y_bin] + y_breaks[y_bin + 1]) / 2
-      ) %>%
-    mutate(
-      xmin = x_breaks[x_bin],
-      xmax = x_breaks[x_bin + 1],
-      ymin = y_breaks[y_bin],
-      ymax = y_breaks[y_bin + 1]
-    )
-  return(surf_df)
-}
 ```
 
-##########################
-Fire Probability
-##########################
-
-temp x RH
+#Calculate:
+error for strike rate prediciton
+error for fire prediciton
 ```{r}
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="relative_humidity",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013),
-                       guide = "none") +
-  labs(
-    title = "(c)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Relative humidity (%)",
-    fill = "Fire probability"
+# Aggregate df to monthly level (one row per gridcell per month/year)
+df_monthly <- df %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(
+    r_strike_pred = first(r_strike),  # already a monthly mean, just take first value
+    .groups = "drop"
   )
-  
-p_fire_t_rh
 
-
-#temp x precip
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="precipitation",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013),
-                       guide = "none") +
-  labs(
-    title = "(f)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Precipitation (mm)",
-    fill = "Fire probability"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_fire_t_p
-
-
-#temp x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="wind",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013),
-                       guide = "none") +
-  labs(
-    title = "(i)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Wind (m/s)",
-    fill = "Fire probability"
-  )+theme_minimal(base_size = 12) 
-  
-p_fire_t_w
-
-
-#precip x rh
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="precipitation",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013),
-                       guide = "none") +
-  labs(
-    title = "(l)",
-    x = "Relative humidity (%)",
-    y = "Precipitation (mm)",
-    fill = "Fire probability"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_fire_p_rh
-
-
-#precip x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="wind", 
-                            y_var="precipitation",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013),
-                       guide = "none") +
-  labs(
-    title = "(o)",
-    x = "Wind (m/s)",
-    y = "Precipitation (mm)",
-    fill = "Fire probability"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_fire_p_w
-
-
-#relative humidity x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="wind",
-                            target_name="P_fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_fire_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.0013)) +
-  labs(
-    title = "(r)",
-    x = "Relative humidity (%)",
-    y = "Wind (m/s)",
-    fill = "Fire probability      "
-  ) + 
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 16)) +
-  guides(fill = guide_colorbar(
-    title.position = "top",      # Place the title above the color bar
-      barwidth = 20,               # Adjust bar width for better horizontal layout
-      barheight = 3,
-    label.theme = element_text(angle = 45, hjust = 1)
-  ))
-  
-p_fire_rh_w
-```
-
-
-
-```{r}
-p_fire_t_rh |p_fire_t_p | p_fire_t_w | p_fire_p_rh | p_fire_p_w | p_fire_rh_w
-
-
-```
-
-
-##########################
-Ignition Efficiency
-##########################
-
-temp x RH
-```{r}
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="relative_humidity",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.51),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(b)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Relative humidity (%)",
-    fill = "Ignition efficiency"
+# Merge with observed monthly strike rate
+df_monthly <- df_monthly %>%
+  left_join(
+    df_strikes %>% dplyr::select(year, lon, lat, summer_monthly_strike_rate),
+    by = c("year", "lon", "lat")
   )
-  
-p_ignite_t_rh
 
-
-#temp x precip
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="precipitation",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.51),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(e)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Precipitation (mm)",
-    fill = "Ignition efficiency"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_ignite_t_p
-
-
-#temp x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="wind",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.51),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(h)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Wind (m/s)",
-    fill = "Ignition efficiency"
-  )+theme_minimal(base_size = 12) 
-  
-p_ignite_t_w
-
-
-#precip x rh
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="precipitation",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.51),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(k)",
-    x = "Relative humidity (%)",
-    y = "Precipitation (mm)",
-    fill = "Ignition efficiency"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_ignite_p_rh
-
-
-#precip x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="wind", 
-                            y_var="precipitation",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.51),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(n)",
-    x = "Wind (m/s)",
-    y = "Precipitation (mm)",
-    fill = "Ignition efficiency"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_ignite_p_w
-
-
-#relative humidity x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="wind",
-                            target_name="P_ignite_prob",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_ignite_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.1),
-                       limits = c(0, 0.51)
-                       ) +
-  labs(
-    title = "(q)",
-    x = "Relative humidity (%)",
-    y = "Wind (m/s)",
-    fill = "Ignition efficiency     "
-  ) + 
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 16)) +
-  guides(fill = guide_colorbar(
-    title.position = "top",      # Place the title above the color bar
-      barwidth = 20,               # Adjust bar width for better horizontal layout
-      barheight = 3,
-    label.theme = element_text(angle = 45, hjust = 1)
-  ))
-  
-p_ignite_rh_w
-```
-
-
-```{r}
-p_ignite_t_rh |p_ignite_t_p | p_ignite_t_w | p_ignite_p_rh | p_ignite_p_w | p_ignite_rh_w
-
-```
-
-
-##########################
-Strike rate
-##########################
-
-temp x RH
-```{r}
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="relative_humidity",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.06),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(a)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Relative humidity (%)",
-    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+gridcell_bias_strike <- df_monthly %>%
+  group_by(lat, lon) %>%
+  #filter(sum(!is.na(summer_monthly_strike_rate)) >= 3) %>%
+  summarise(
+    mean_strike_bias = mean(r_strike_pred - summer_monthly_strike_rate, na.rm = TRUE),
+    .groups = "drop"
   )
-  
-p_r_strike_t_rh
 
-
-#temp x precip
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="precipitation",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.06),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(d)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Precipitation (mm)",
-    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_r_strike_t_p
-
-
-#temp x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="wind",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.06),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(g)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Wind (m/s)",
-    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
-  ) + theme_minimal(base_size = 12) 
-  
-p_r_strike_t_w
-
-
-#precip x rh
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="precipitation",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.06),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(j)",
-    x = "Relative humidity (%)",
-    y = "Precipitation (mm)",
-    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_r_strike_p_rh
-
-
-#precip x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="wind", 
-                            y_var="precipitation",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.06),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(m)",
-    x = "Wind (m/s)",
-    y = "Precipitation (mm)",
-    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_r_strike_p_w
-
-
-#relative humidity x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="wind",
-                            target_name="r_strike",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_r_strike_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.01),
-                       limits = c(0, 0.06)
-                       ) +
-  labs(
-    title = "(p)",
-    x = "Relative humidity (%)",
-    y = "Wind (m/s)",
-    fill = "Strike rate     "
-  ) + 
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 16)) +
-  guides(fill = guide_colorbar(
-    title.position = "top",      # Place the title above the color bar
-      barwidth = 20,               # Adjust bar width for better horizontal layout
-      barheight = 3,
-    label.theme = element_text(angle = 45, hjust = 1)
-  ))
-  
-p_r_strike_rh_w
-```
-
-```{r}
-p_r_strike_t_rh |p_r_strike_t_p | p_r_strike_t_w | p_r_strike_p_rh | p_r_strike_p_w | p_r_strike_rh_w
-
-```
-
-##########################
-Observed Fire Rate
-##########################
-
-temp x RH
-```{r}
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="relative_humidity",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(a)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Relative humidity (%)",
-    fill = "Observed fire rate"
+#calculate bias for fire prediction
+gridcell_bias_fire <- df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    bias_fire = mean(i.P_fire - fire, na.rm = TRUE),
+    .groups = "drop"
   )
-  
-p_obs_fire_t_rh
 
-
-#temp x precip
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="precipitation",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(b)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Precipitation (mm)",
-    fill = "Observed fire rate"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_obs_fire_t_p
-
-
-#temp x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="temperature", 
-                            y_var="wind",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(c)",
-    x = expression("Temperature ("*degree*C*")"),
-    y = "Wind (m/s)",
-    fill = "Observed fire rate"
-  )+theme_minimal(base_size = 12) 
-  
-p_obs_fire_t_w
-
-
-#precip x rh
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="precipitation",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(d)",
-    x = "Relative humidity (%)",
-    y = "Precipitation (mm)",
-    fill = "Observed fire rate"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_obs_fire_p_rh
-
-
-#precip x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="wind", 
-                            y_var="precipitation",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005),
-                       guide = "none"
-                       ) +
-  labs(
-    title = "(e)",
-    x = "Wind (m/s)",
-    y = "Precipitation (mm)",
-    fill = "Observed fire rate"
-  ) + 
-  theme_minimal(base_size = 12) 
-  
-p_obs_fire_p_w
-
-
-#relative humidity x wind
-
-plot_dat <- plot_preprocess(data=df, 
-                            x_var="relative_humidity", 
-                            y_var="wind",
-                            target_name="fire",
-                            x_bins=40, y_bins=40, min_count=200)
-
-p_obs_fire_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
-  geom_rect(color = NA) +
-  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
-                       limits = c(0, 0.005)
-                       ) +
-  labs(
-    title = "(f)",
-    x = "Relative humidity (%)",
-    y = "Wind (m/s)",
-    fill = "Observed fire rate      "
-  ) + 
-  theme_minimal(base_size = 12) + 
-  theme(legend.position = "bottom",
-        legend.title = element_text(size = 16)) +
-  guides(fill = guide_colorbar(
-    title.position = "top",      # Place the title above the color bar
-      barwidth = 20,               # Adjust bar width for better horizontal layout
-      barheight = 3,
-    label.theme = element_text(angle = 45, hjust = 1)
-  ))
-  
-p_obs_fire_rh_w
+summary_df <- summary_df %>%
+  left_join(gridcell_bias_fire, by = c("lat", "lon"))%>%
+  left_join(gridcell_bias_strike, by = c("lat", "lon"))
 ```
 
+Get total number of strikes per gridcell for the study period (2001-2011)
 ```{r}
-p_obs_fire_t_rh |p_obs_fire_t_p | p_obs_fire_t_w | p_obs_fire_p_rh | p_obs_fire_p_w | p_obs_fire_rh_w
+#read in observed monthly strike count data
+df_strikes_monthly <- read.csv(fil.path(data_root, "Alaska_era5_lightning_monthly_summaries_2001_2012.csv"))[,2:14]
+df_strikes_monthly <- df_strikes_monthly %>% dplyr::select(year, month, lon, lat, strikes_monthly_sum)
+
+#sum strikes
+summary_obs_strike_sum <- df_strikes_monthly %>%
+  group_by(lat, lon) %>%
+  summarise(
+    n_strikes = sum(strikes_monthly_sum))
+
+#merge observed strike count with summary df
+summary_df <- merge(summary_df, summary_obs_strike_sum, by=c("lat","lon"))
 
 ```
 
+Calculate observed ignition rate: the rate of lightning strikes that cause a fire (#fires/#strikes), per gridcell, across the entire study period (2001-2011)
 ```{r}
-p <- (p_r_strike_t_rh / p_r_strike_t_p / p_r_strike_t_w / p_r_strike_p_rh / p_r_strike_p_w / p_r_strike_rh_w)|(p_ignite_t_rh / p_ignite_t_p / p_ignite_t_w / p_ignite_p_rh / p_ignite_p_w / p_ignite_rh_w) | (p_fire_t_rh / p_fire_t_p / p_fire_t_w / p_fire_p_rh / p_fire_p_w / p_fire_rh_w)
-#(p_obs_fire_t_rh / p_obs_fire_t_p / p_obs_fire_t_w / p_obs_fire_p_rh / p_obs_fire_p_w / p_obs_fire_rh_w)
+summary_df <- summary_df %>%
+  mutate(obs_ignite = n_fire/n_strikes) %>%
+  mutate(obs_ignite = replace_na(obs_ignite, 0))
+```
 
+Get min and max values for color plotting
+```{r}
+#global min and max fire probabilities/frequencies
+min_value_fire <- min(c(summary_df$fire_freq, summary_df$P_fire), na.rm = TRUE)
+max_value_fire <- max(c(summary_df$fire_freq, summary_df$P_fire), na.rm = TRUE)
 
+#global min and max strike rates
+min_value_strike <- min(c(summary_df$obs_r_strike, summary_df$r_strike), na.rm = TRUE)
+max_value_strike <- max(c(summary_df$obs_r_strike, summary_df$r_strike), na.rm = TRUE)
+
+#global min and max ignition probabilities/frequencies
+min_value_ignite <- min(c(summary_df$obs_ignite, summary_df$P_ignite), na.rm = TRUE)
+max_value_ignite <- max(c(summary_df$obs_ignite, summary_df$P_ignite), na.rm = TRUE)
+```
+
+Make maps!
+
+```{r}
+p_strike <- ggplot(summary_df, aes(x = lon, y = lat, fill = r_strike)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_strike, max_value_strike), 
+    name = expression(atop("Predicted lightning", "strikes/month/km"^2)),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(a)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16))
+
+p_strike
 ```
 
 
 ```{r}
-ggsave(file.path(figure_root, "Figure_7.png"), plot = p, width = 15, height = 30, dpi = 700, units = "in")
+p_strike_obs <- ggplot(summary_df, aes(x = lon, y = lat, fill = obs_r_strike)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_strike, max_value_strike), 
+    name = expression(atop("Observed lightning", "strikes/month/km"^2)),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(d)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16))
+
+p_strike_obs
+```
+
+
+
+```{r}
+max_abs_bias <- max(abs(summary_df$mean_strike_bias), na.rm = TRUE)
+
+p_strike_bias <- ggplot(summary_df, aes(x = lon, y = lat, fill = mean_strike_bias)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  # scale_fill_viridis_c(
+  #   option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+  #   direction = -1,
+  #   name = expression(atop("Mean Bias", "strikes/month/km"^2)),
+  #   guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+   scale_fill_distiller(
+  palette = "PuOr",
+  limits = c(-max_abs_bias, max_abs_bias),
+  name = expression(atop("Mean Bias", "strikes/month/km"^2)),
+  guide = guide_colorbar(direction = "horizontal", title.position = "top")
+) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(g)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16))
+
+p_strike_bias
+```
+
+```{r}
+p_ignite <- ggplot(summary_df, aes(x = lon, y = lat, fill = P_ignite)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    #limits = c(min_value_ignite, max_value_ignite), 
+    #name = expression(Predicted~ignition~efficiency),
+    name = expression(atop("Predicted ignition efficiency", "P(ignition | lightning)")),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top")
+  ) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(b)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.margin = margin(t = 5, r = 15, b = 5, l = 10), 
+    legend.position = c(0.65, 0.16))
+
+p_ignite
+```
+
+```{r}
+p_ignite_obs <- ggplot(summary_df, aes(x = lon, y = lat, fill = obs_ignite)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    #limits = c(min_value_ignite, max_value_ignite), 
+    #name = expression(Observed~ignition~rate),
+    name = expression(atop("Observed ignition rate", "(fire count / strike count)")),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top")
+  ) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(e)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.margin = margin(t = 5, r = 20, b = 5, l = 10), 
+    legend.position = c(0.65, 0.15))
+
+p_ignite_obs
+```
+
+
+```{r}
+p_fire <- ggplot(summary_df, aes(x = lon, y = lat, fill = P_fire)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_fire, max_value_fire), 
+    #name = expression(Predicted~fire~probability),
+    name = expression(atop("Predicted fire probability", "P(fire | lightning, ignition efficiency)")),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top")
+  ) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(c)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.margin = margin(t = 5, r = 20, b = 5, l = 10), 
+    legend.position = c(0.65, 0.16))
+
+p_fire
+```
+
+```{r}
+p_obs_fire <- ggplot(summary_df, aes(x = lon, y = lat, fill = fire_freq)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_fire, max_value_fire), 
+    #name = expression(Observed~fire~rate),
+    name = expression(atop("Observed fire rate", "(fire days / total days)")),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top")
+  ) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(f)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.margin = margin(t = 5, r = 20, b = 5, l = 10), 
+    legend.position = c(0.65, 0.16))
+
+p_obs_fire
+```
+
+
+```{r}
+max_abs_bias <- max(abs(summary_df$bias_fire), na.rm = TRUE)
+
+p_bias_fire <- ggplot(summary_df, aes(x = lon, y = lat, fill = bias_fire)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  # scale_fill_viridis_c(
+  #   option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+  #   #direction = -1,
+  #   name = expression(ROC~AUC),
+  #   guide = guide_colorbar(direction = "horizontal", title.position = "top")
+  # ) +
+  scale_fill_distiller(
+  palette = "PuOr",
+  limits = c(-max_abs_bias, max_abs_bias),  # symmetric around 0
+  name = expression(atop("Mean Bias", "(fire probability)")),
+  #name = "Mean bias\n([predicted - observed)",
+  guide = guide_colorbar(direction = "horizontal", title.position = "top")
+) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(i)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.17))
+
+p_bias_fire
+```
+
+Elevation plot
+```{r}
+library(geodata)
+library(terra)
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+p_elevation
+```
+
+```{r}
+max_abs_bias <- max(abs(summary_df$bias_fire), na.rm = TRUE)
+
+p_bias_fire_elev <- ggplot(summary_df, aes(x = lon, y = lat, fill = bias_fire)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_distiller(
+  palette = "PuOr",
+  limits = c(-max_abs_bias, max_abs_bias),  # symmetric around 0
+  name = expression(atop("Mean Bias", "(fire probability)")),
+  guide = guide_colorbar(direction = "horizontal", title.position = "top")
+) +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250),
+               inherit.aes = FALSE) +  
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.17))
+
+p_bias_fire_elev
+
+```
+
+```{r}
+max_abs_bias <- max(abs(summary_df$mean_strike_bias), na.rm = TRUE)
+
+p_strike_bias_elev <- ggplot(summary_df, aes(x = lon, y = lat, fill = mean_strike_bias)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+   scale_fill_distiller(
+  palette = "PuOr",
+  limits = c(-max_abs_bias, max_abs_bias),
+  name = expression(atop("Mean Bias", "strikes/month/km"^2)),
+  guide = guide_colorbar(direction = "horizontal", title.position = "top")
+) +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250),
+               inherit.aes = FALSE) +  
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(g)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16))
+
+p_strike_bias_elev
+```
+
+```{r}
+#blank_plot <- ggplot() + theme_void()
+
+tight_margin <- theme(plot.margin = margin(t = 2, r = 2, b = 2, l = 2))
+
+p_strike      <- p_strike      + tight_margin
+p_ignite      <- p_ignite      + tight_margin
+p_fire        <- p_fire        + tight_margin
+p_strike_obs  <- p_strike_obs  + tight_margin
+p_ignite_obs  <- p_ignite_obs  + tight_margin
+p_obs_fire    <- p_obs_fire    + tight_margin
+
+library(patchwork)
+
+top_rows <- (p_strike | p_ignite | p_fire) /
+            (p_strike_obs | p_ignite_obs | p_obs_fire)
+
+bottom_row <- (p_strike_bias_elev | p_bias_fire_elev)
+
+final <- top_rows / bottom_row +
+  plot_layout(heights = c(1, 1, 1.5))
+```
+
+```{r}
+ggsave(file.path(figure_root, "Figure_6.png"), plot = final, width = 6, height = 12, dpi = 1100, units = "in")
 ```

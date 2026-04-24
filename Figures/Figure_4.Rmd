@@ -1,22 +1,33 @@
 ---
-title: "Figure_4"
+title: "Figure 4"
 author: "Charlotte Uden"
-date: "2026-01-29"
+date: "2026-04-20"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
+Reviewer comment:
 
-ROC and PR curves and reliability diagram
+The model(s) were fit and tested for 2002-2011 and 2012-2018. This makes sense from the standpoint of the sensor changes as described, however the results don’t mention any evaluation of RMSE, etc. outside of the fitting period so it’s hard to judge the efficacy of the results. Given the limited lightning data in Alaska, one solution could be to produce some evaluation statistics for the period not used in the fitting (i.e. model fit for 2002-2011 is evaluated also against the 2012-2018 period). Earlier lightning observations are also available starting in the early 1990s that could be helpful as another independent test set.
+
+Our Response:
+We agree that applying parameter estimates outside the fitting period would strengthen our assessment of model generalizability. We have taken your suggestion and, for the ‘best’ lightning and ignition models, applied parameters from each period to data from the alternate period to check for out-of-period performance. We calculated performance metrics from these new predictions and added them to Figures 2 and 3 for clear in-period and out-of-period comparison. Finally, we added sections 3.1.4 and 3.2.5, “Cross validation across time periods,” to the results section. 
+
+
+Figure 4. Performance of ignition probability models across predictor groups, modeling approaches, and training periods. Panels show five evaluation metrics: (a) area under the receiver-operating characteristic curve (ROC AUC), (b) area under the precision-recall curve (PR AUC), (c) brier score, (d) calibration intercept, and (e) calibration slope. Points represent model estimates with horizontal bars indicating 95% bootstrap confidence intervals. Predictor groups are arranged on the y-axis, approach distinguished by point color (glmnet=green, Bayesian=orange) and training period distinguished by point shape (2002-2011=circle, 2012-2018=triangle). Each panel is divided into two sections: the upper facet (out-of-period test) shows performance of the climate + fuel moisture + vegetation Bayesian logistic regression when parameters estimated from one period are applied to data from the alternate period, while the lower facet (in-period test) shows performance evaluated on a held-out 20% test set from the same period used for training. In panels (a) and (b), higher values indicate stronger discrimination with dashed vertical lines marking no-skill thresholds (ROC AUC=0.5; PR AUC=1.55x10-4 for 2002-2011 and PR AUC=1.89x10-5 for 2012-2018). Panel (c) displays Brier scores on a reversed axis so that better performance appears on the right. Panels (d) and (e) assess calibration: a calibration intercept of 0 indicates unbiased predictions, and a slope of 1 indicates perfectly scaled probabilities (dashed vertical lines provide a reference).
+
 
 ```{r}
-library(tidyr)
-library(patchwork)
-library(dplyr)
+library(scales)
 library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(scales)
+library(stringr)
+library(tidyverse)
+library(cowplot)
+library(ggpubr)
 ```
+
 
 Load configuration files
 - location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
@@ -45,388 +56,219 @@ figure_root <- config[["figure_root"]]
 ```
 
 ```{r}
-df <- read.csv(file.path(predictions_root, "fire_predictions_and_observations.csv"))
-head(df)
-#p = predicitons of fire prob, P_fire
-#y = binary observations of fire outcome: 0 or 1
-p <- df$p
-y <- df$y
+df <- read.csv(file.path(table_root, "ignition_efficiency_model_performance_time_transfer_test.csv"))
 ```
 
 ```{r}
-## =========================================================
-## Helpers (used internally)
-## =========================================================
 
-# Drop NAs and check basic validity
-.clean_xy <- function(p, y) {
-  if (length(p) != length(y)) {
-    stop("p and y must have the same length.")
-  }
-  ok <- is.finite(p) & is.finite(y)
-  p <- p[ok]; y <- y[ok]
-  list(p = p, y = y)
-}
+# ── 1. Data preparation ───────────────────────────────────────────────────────
 
-# Clip probabilities away from 0 and 1 to avoid log(0)
-.clip_probs <- function(p, eps = 1e-15) {
-  p[p < eps]      <- eps
-  p[p > 1 - eps]  <- 1 - eps
-  p
-}
+desired_order <- c(
+  "climate", "fuel moisture", "vegetation",
+  "climate & fuel moisture", "climate & vegetation",
+  "fuel moisture & vegetation", "climate, fuel moisture & vegetation"
+)
 
-## =========================================================
-## 1) Brier score
-## =========================================================
-# Mean squared error between probabilities and 0/1 outcomes
-brier_score <- function(p, y) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
-  mean((p - y)^2)
-}
-
-## =========================================================
-## 2) Brier Skill Score (relative to climatology)
-## =========================================================
-# Baseline = climatological event probability (mean(y))
-# BSS = 1 - BS_model / BS_climatology
-brier_skill_score <- function(p, y) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
-  
-  if (length(unique(y)) < 2) {
-    warning("y has no variation (all 0s or all 1s); BSS undefined.")
-    return(NA_real_)
-  }
-  
-  bs_model <- mean((p - y)^2)
-  p_clim   <- mean(y)
-  bs_clim  <- mean((p_clim - y)^2)
-  
-  if (bs_clim == 0) {
-    warning("Climatological Brier score is 0; BSS undefined.")
-    return(NA_real_)
-  }
-  
-  1 - bs_model / bs_clim
-}
-
-## =========================================================
-## 3) Logarithmic score (log loss)
-## =========================================================
-# Negative log-likelihood of Bernoulli outcomes under predicted probabilities
-log_loss <- function(p, y, eps = 1e-15) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
-  p <- .clip_probs(p, eps)
-  -mean(y * log(p) + (1 - y) * log(1 - p))
-}
-
-
-## =========================================================
-## 4) ROC AUC (rank-based, no packages)
-## =========================================================
-# Area under ROC curve; threshold-free discrimination metric
-roc_auc <- function(p, y) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
-  
-  y_vals <- unique(y)
-  if (!all(y_vals %in% c(0, 1))) {
-    stop("y must contain only 0 and 1.")
-  }
-  if (length(unique(y)) < 2) {
-    warning("y has no variation (all 0s or all 1s); ROC AUC undefined.")
-    return(NA_real_)
-  }
-  
-  # Rank predictions (average ranks for ties)
-  r <- rank(p, ties.method = "average")
-  
-  n_pos <- sum(y == 1)
-  n_neg <- sum(y == 0)
-  
-  # Sum of ranks for positive cases
-  sum_r_pos <- sum(r[y == 1])
-  
-  # Mann-Whitney U statistic -> AUC
-  auc <- (sum_r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-  auc
-}
-
-## =========================================================
-## 5) Precision–Recall AUC (PR-AUC)
-## =========================================================
-# PR-AUC is more informative under class imbalance (rare fires)
-pr_auc <- function(p, y) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
-  
-  y_vals <- unique(y)
-  if (!all(y_vals %in% c(0, 1))) {
-    stop("y must contain only 0 and 1.")
-  }
-  P <- sum(y == 1)
-  N <- sum(y == 0)
-  if (P == 0) {
-    warning("No positive events in y; PR-AUC undefined.")
-    return(NA_real_)
-  }
-  
-  # Sort by decreasing probability
-  o <- order(p, decreasing = TRUE)
-  y_sorted <- y[o]
-  p_sorted <- p[o]
-  
-  # Cumulative true positives and false positives
-  tp <- cumsum(y_sorted == 1)
-  fp <- cumsum(y_sorted == 0)
-  
-  recall    <- tp / P
-  precision <- tp / (tp + fp)
-  
-  # Add (0, baseline) point for integration
-  recall    <- c(0, recall)
-  precision <- c(mean(y), precision)  # baseline precision = prevalence
-  
-  # Trapezoidal rule in (recall, precision) space
-  # Note: recall is non-decreasing by construction
-  pr_auc_val <- sum(
-    0.5 * (precision[-1] + precision[-length(precision)]) *
-      diff(recall)
+# In-period test set rows
+df_inperiod <- df %>%
+  filter(input == "test data (in-period)") %>%
+  mutate(
+    facet_group = "In-period",
+    y_label     = as.character(predictors)
   )
-  
-  pr_auc_val
+
+# Cross-period transferability rows
+df_transfer <- df %>%
+  filter(input != "test data (in-period)") %>%
+  mutate(
+    facet_group = "Out-of-period",
+    y_label     = as.character(y_label)  # already set as arrow labels in df_plot
+  )
+
+df_plot3 <- bind_rows(df_inperiod, df_transfer) %>%
+  mutate(
+    facet_group = factor(facet_group,
+                         levels = c("Out-of-period", "In-period")),
+    y_label = factor(y_label,
+                     levels = c(
+                       "2001-2012 \u2192 2012-2018",
+                       "2012-2018 \u2192 2001-2012",
+                       desired_order
+                     )),
+    approach       = factor(approach, levels = c("glmnet", "Bayesian")),
+    training_years = factor(training_years, levels = c("2001-2012", "2012-2018"))
+  )
+
+# ── 2. Shared aesthetics ──────────────────────────────────────────────────────
+
+color_vals3 <- c("glmnet" = "#d018d0", "Bayesian" = "#ffa908")
+shape_vals3 <- c("2001-2012" = 16, "2012-2018" = 17)
+dodge        <- position_dodge(width = 0.6)
+
+base_theme3 <- theme_bw(base_size = 11) +
+  theme(
+    axis.title.y     = element_blank(),
+    legend.position  = "none",
+    strip.background = element_blank(),
+    strip.text       = element_blank(),
+    axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin      = ggplot2::margin(t = 2.5, r = 10, b = 2.5, l = 30)
+  )
+
+theme_with_strips3 <- base_theme3 +
+  theme(
+    strip.text.y     = element_text(size = 6, face = NULL,
+                                    angle = 90,
+                                    margin = margin(l = 4, r = 4)),
+    strip.background = element_rect(fill = "white", color = "grey70"),
+    strip.placement  = "outside"
+  )
+
+add_facet_scales3 <- function(p, show_strips = FALSE, right_axis = FALSE) {
+  p2 <- p +
+    facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+    scale_color_manual(values = color_vals3, name = "Approach") +
+    scale_shape_manual(values = shape_vals3,  name = "Training period")
+
+  if (right_axis) {
+    p2 <- p2 +
+      scale_y_discrete(position = "right",
+                       labels = function(x) str_wrap(x, width = 25)) +
+      theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+  } else {
+    p2 <- p2 +
+      scale_y_discrete(labels = function(x) str_wrap(x, width = 25))
+  }
+
+  if (show_strips) {
+    p2 + theme_with_strips3
+  } else {
+    p2 + base_theme3
+  }
 }
 
-## =========================================================
-## 6) Expected vs observed fire counts
-## =========================================================
-# Returns a named list: expected (sum of p), observed (sum of y)
-expected_observed_counts <- function(p, y) {
-  dat <- .clean_xy(p, y); p <- dat$p; y <- dat$y
+pts_eb3 <- function(xvar, xmin_var, xmax_var) {
   list(
-    expected = sum(p),
-    observed = sum(y)
+    geom_point(aes(x = .data[[xvar]]),
+               size = 2.8, alpha = 0.9, position = dodge),
+    geom_errorbarh(aes(xmin = .data[[xmin_var]], xmax = .data[[xmax_var]]),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge)
   )
 }
 
-#note: we sum predicted probabilities because simulating 0/1 from the probability (ie sampling from a binomial distribution) adds noise - not good for model verification. 
+# ── 3. Individual panels ──────────────────────────────────────────────────────
 
-#expected fire counts are summed rather than stochastically sampled since the expected sum of Bernoulli  trials provides a deterministic and unbiased estimate of aggregate event frequency. 
+# (a) ROC AUC — strip labels ON, left y-axis
+p_auc <- add_facet_scales3(show_strips = TRUE, right_axis = FALSE,
+  p = ggplot(df_plot3, aes(y = y_label, color = approach, shape = training_years)) +
+    pts_eb3("AUC", "AUC_CI_low", "AUC_CI_high") +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(limits = c(0.3, 1.0),
+                       breaks = seq(0.3, 1.0, by = 0.1),
+                       labels = label_number(accuracy = 0.1)) +
+    labs(x = "ROC AUC") +
+    ggtitle("(a)")
+)
 
-#later on, for something like forecasting or implementing into a DGVM, we would sample from a binomial distribution - variability contains information. 
+# (b) PR AUC — no strips, RIGHT y-axis
+p_pr_auc <- add_facet_scales3(show_strips = FALSE, right_axis = TRUE,
+  p = ggplot(df_plot3, aes(y = y_label, color = approach, shape = training_years)) +
+    pts_eb3("PR_AUC", "PR_AUC_CI_low", "PR_AUC_CI_high") +
+    scale_x_continuous(limits = c(0.1, 1.0),
+                       breaks = seq(0.1, 1.0, by = 0.1),
+                       labels = label_number(accuracy = 0.1)) +
+    labs(x = "PR AUC") +
+    ggtitle("(b)")
+)
 
+# (c) Brier Score — reversed axis, no strips, left y-axis
+p_brier <- add_facet_scales3(show_strips = FALSE, right_axis = FALSE,
+  p = ggplot(df_plot3, aes(y = y_label, color = approach, shape = training_years)) +
+    pts_eb3("Brier", "Brier_CI_low", "Brier_CI_high") +
+    scale_x_reverse(breaks = seq(0.43, 0.13, by = -0.02),
+                    labels = label_number(accuracy = 0.01),
+                    limits = c(0.43, 0.13)) +
+    labs(x = "Brier Score") +
+    ggtitle("(c)")
+)
 
-```
+# (d) Calibration Intercept — no strips, RIGHT y-axis
+p_calib_int <- add_facet_scales3(show_strips = FALSE, right_axis = TRUE,
+  p = ggplot(df_plot3, aes(y = y_label, color = approach, shape = training_years)) +
+    pts_eb3("calib_intercept", "calib_intercept_CI_low", "calib_intercept_CI_high") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(breaks = seq(-2, 14, by = 2),
+                       labels = label_number(accuracy = 1),
+                       limits = c(-2, 14)) +
+    labs(x = "Calibration Intercept") +
+    ggtitle("(d)")
+)
 
-#ROC curve
-```{r}
-roc_curve_df <- function(p, y) {
-  stopifnot(length(p) == length(y))
-  stopifnot(all(y %in% c(0, 1)))
+# (e) Calibration Slope — no strips, left y-axis
+p_calib_slope <- add_facet_scales3(show_strips = FALSE, right_axis = FALSE,
+  p = ggplot(df_plot3, aes(y = y_label, color = approach, shape = training_years)) +
+    pts_eb3("calib_slope", "calib_slope_CI_low", "calib_slope_CI_high") +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(breaks = seq(-4, 15, by = 2),
+                       labels = label_number(accuracy = 1),
+                       limits = c(-4, 15)) +
+    labs(x = "Calibration Slope") +
+    ggtitle("(e)")
+)
 
-  # Remove NAs
-  ok <- is.finite(p) & is.finite(y)
-  p <- p[ok]
-  y <- y[ok]
+# ── 4. Shared horizontal legend ───────────────────────────────────────────────
 
-  # Sort by decreasing probability
-  o <- order(p, decreasing = TRUE)
-  p <- p[o]
-  y <- y[o]
-
-  P <- sum(y == 1)
-  N <- sum(y == 0)
-
-  tp <- cumsum(y == 1)
-  fp <- cumsum(y == 0)
-
-  tpr <- tp / P
-  fpr <- fp / N
-
-  # Add origin
-  data.frame(
-    fpr = c(0, fpr),
-    tpr = c(0, tpr),
-    threshold = c(Inf, p)
+legend_plot3 <- ggplot(df_plot3,
+                       aes(x = AUC, y = y_label,
+                           color = approach, shape = training_years)) +
+  geom_point(size = 2.8) +
+  scale_color_manual(values = color_vals3, name = "Approach") +
+  scale_shape_manual(values = shape_vals3,  name = "Years") +
+  guides(color = guide_legend(nrow = 1),
+         shape = guide_legend(nrow = 1)) +
+  theme_void() +
+  theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.title      = element_text(size = 10),
+    legend.text       = element_text(size = 9),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.0, "cm"),
+    legend.spacing.x  = unit(2, "cm")
   )
-}
 
-roc_df <- roc_curve_df(p, y)
+shared_legend3 <- ggpubr::get_legend(legend_plot3)
 
-#add ROC AUC (area under the curve) to the plot
-roc_auc_text <- sprintf("ROC AUC = %.3f", roc_auc(p, y))
+# ── 5. Blank plot to fill grid ────────────────────────────────────────────────
 
-p_roc <- ggplot(roc_df, aes(fpr, tpr)) +
-  geom_line(size = 1) +
-  geom_abline(linetype = "dashed", color = "grey50") +
-  #coord_equal() +
-  labs(
-    x = "False Positive Rate",
-    y = "True Positive Rate",
-    title = "(b)"
-  ) +
-  annotate("text", x = 0.75, y = 0.125, label = roc_auc_text, 
-           color = "red", size = 4, fontface = "bold") +
-  theme_bw()
+blank_plot <- ggplot() + theme_void() + theme(plot.background = element_rect(fill = "white", color = NA))
 
-p_roc
-```
+# ── 6. Assemble final figure ──────────────────────────────────────────────────
 
-#PR Curve
-```{r}
-pr_curve_df <- function(p, y) {
-  stopifnot(length(p) == length(y))
-  stopifnot(all(y %in% c(0, 1)))
+fig_panels3 <- plot_grid(
+  p_auc,    p_pr_auc,
+  p_brier,  p_calib_int,
+  p_calib_slope, blank_plot,
+  ncol = 2,
+  align = "h"
+)
 
-  ok <- is.finite(p) & is.finite(y)
-  p <- p[ok]
-  y <- y[ok]
+final_fig3 <- plot_grid(
+  fig_panels3,
+  shared_legend3,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
 
-  o <- order(p, decreasing = TRUE)
-  p <- p[o]
-  y <- y[o]
-
-  P <- sum(y == 1)
-
-  tp <- cumsum(y == 1)
-  fp <- cumsum(y == 0)
-
-  recall <- tp / P
-  precision <- tp / (tp + fp)
-
-  # Add baseline point
-  data.frame(
-    recall = c(0, recall),
-    precision = c(mean(y), precision),
-    threshold = c(Inf, p)
-  )
-}
-
-pr_df <- pr_curve_df(p, y)
-
-#annotate thresholds
-annot_thresh <- c(1e-4, 5e-4, 1e-3, 2e-3)
-#find closest rows to these thresholds
-ann_df <- lapply(annot_thresh, function(t) {
-  pr_df %>%
-    mutate(diff = abs(threshold - t)) %>%
-    slice_min(diff, n = 1)
-}) %>%
-  bind_rows() %>%
-  mutate(label = paste0("t=", sprintf("%.6f", threshold)))
-
-pr_auc_text <- sprintf("PR AUC = %.5f", pr_auc(p, y))
-
-p_pr <- ggplot(pr_df, aes(recall, precision)) +
-  geom_line(size = 1, color = "black") +
-  geom_hline(yintercept = mean(y), linetype = "dashed", color = "grey50") +
-
-  # # annotation points
-  # geom_point(data = ann_df,
-  #            aes(recall, precision),
-  #            color = "red", size = 3) +
-
-  # geom_label(data = ann_df,
-  #          aes(recall, precision, label = label),
-  #          hjust = -0.1,
-  #          vjust = 0,
-  #          size = 3,
-  #          fill = "white",
-  #          label.size = 0) +
-
-  labs(
-    x = "Recall",
-    y = "Precision",
-    title = "(c)"
-  ) +
-
-  annotate("text", x = 0.8, y = 0.0006,
-           label = pr_auc_text,
-           color = "red", size = 4, fontface = "bold") +
-
-  theme_bw()
-
-p_pr
+final_fig3
 
 
+ggsave(file.path(figure_root, "Figure_3.png"),
+        plot = final_fig3, width = 10, height = 10, dpi = 1100, units = "in")
 
 ```
 
 
-#Reliability curve with quantile binning
-(without quantile binning, all probabilities are in the first bin)
-```{r}
-reliability_curve_quantile <- function(p, y, nbins = 10) {
-  dat <- .clean_xy(p, y)
-  p <- dat$p; y <- dat$y
-  
-  # quantile-based breaks (to avoid empty bins) - based on the quantiles of predictions
-  probs  <- seq(0, 1, length.out = nbins + 1)
-  breaks <- quantile(p, probs = probs, na.rm = TRUE) 
-  breaks <- unique(breaks)  # in case of ties
-  
-  df <- data.frame(p = p, y = y) %>%
-    mutate(bin = cut(p, breaks = breaks, include.lowest = TRUE)) %>%
-    group_by(bin) %>%
-    summarise(
-      n          = n(),
-      mean_pred  = mean(p),
-      event_rate = mean(y),
-      .groups    = "drop"
-    )
-  
-  # extract numeric bounds
-  df$bin_lower <- as.numeric(sub("\\((.+),.*", "\\1", sub("\\[", "(", df$bin)))
-  df$bin_upper <- as.numeric(sub(".*,(.+)\\]", "\\1", sub("\\)", "]", df$bin)))
-  df$bin_mid   <- (df$bin_lower + df$bin_upper) / 2
-  
-  df %>%
-    dplyr::select(bin_lower, bin_upper, bin_mid, n, mean_pred, event_rate)
-}
 
-rel_tab <- reliability_curve_quantile(p, y, nbins = 10)
-rel_tab
-
-p_rel <- ggplot(rel_tab, aes(x = mean_pred, y = event_rate)) +
-  geom_point(shape = 1) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
-  xlab("Mean predicted probability") +
-  ylab("Observed event frequency") +
-  ggtitle("(a)") +
-  ylim(0, 0.0007) +
-  xlim(0, 0.0007) +
-  theme_bw() 
-
-p_rel
-
-# rel_tab <- mutate(rel_tab, n_pred = n*mean_pred, n_event = n*event_rate)
-# 
-# p_rel <- ggplot(rel_tab, aes(x = n_pred, y = n_event)) +
-#   geom_point(shape = 1) +
-#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
-#   xlab("Summed predicted probability") +
-#   ylab("Summed observed event frequency") +
-#   ggtitle("(c)") +
-#   ylim(0, 270) +
-#   xlim(0, 270) +
-#   theme_bw() 
-# 
-# p_rel
-```
-
-
-```{r}
-blank_plot <- ggplot() + theme_void()
-
-grid.arrange(p_roc, p_pr, p_rel, blank_plot, nrow=2, ncol=2, heights=c(1,1), widths=c(1, 1))
-
-layout <- rbind(c(1, 2), 
-                c(3, 3))
-
-
-grid.arrange(p_rel, p_roc, p_pr, layout_matrix = layout)
-
-p <- grid.arrange(p_rel, p_roc, p_pr, layout_matrix = layout)
-```
-
-```{r}
-ggsave(file.path(figure_root, "Figure_4.png"), plot = p, width = 9, height = 9, dpi = 1100, units = "in")
-```
 
