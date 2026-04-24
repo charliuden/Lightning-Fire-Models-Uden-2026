@@ -1,0 +1,766 @@
+---
+title: "Temporal Transferability Test"
+author: "Charlotte Uden"
+date: "2026-04-19"
+output: html_document
+---
+Reviewer comment:
+The model(s) were fit and tested for 2002-2011 and 2012-2018. This makes sense from the standpoint of the sensor changes as described, however the results don’t mention any evaluation of RMSE, etc. outside of the fitting period so it’s hard to judge the efficacy of the results. Given the limited lightning data in Alaska, one solution could be to produce some evaluation statistics for the period not used in the fitting (i.e. model fit for 2002-2011 is evaluated also against the 2012-2018 period). Earlier lightning observations are also available starting in the early 1990s that could be helpful as another independent test set.
+
+Our Response:
+We agree that applying parameter estimates outside the fitting period would strengthen our assessment of model generalizability. We have taken your suggestion and, for the ‘best’ lightning and ignition models, applied parameters from each period to data from the alternate period to check for out-of-period performance. We calculated performance metrics from these new predictions and added them to Figures 2 and 3 for clear in-period and out-of-period comparison. Finally, we added sections 3.1.4 and 3.2.5, “Cross validation across time periods,” to the results section. 
+
+Notes:
+theyre asking for somethind a bit different from general model performance. They ask about temporal transferability. Their underlying concern seems to be: given that we eventually want to apply this framework to paleoclimate data spanning very different time periods, how confident can we be that model parameters estimated on one period generalize to another? A random split within a period tests interpolation; applying parameters across the two sensor eras tests something closer to the kind of temporal extrapolation your paleo application will require. This is a worth while distinction, and it is directly relevant to my paper's stated goals.
+
+1) Apply parameters from the 'best' 2002-2011 ignition model to predict ignition from 2012-2018 climate data and calculate performance metrics. How does the model perform in comparison with predictions made from the original training period?
+2) Apply parameters from the 'best' 2012-2018 ignition model to predict ignition from 2002-2011 climate data and again compare its performance with its performance on teh 2012-2018 data it was trained on?
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths (ie line 52)
+```
+
+Functions for calculating performance metrics
+```{r}
+# ============================================================
+# Bootstrap CI versions of each performance metric
+# Each function returns: estimate, ci_low, ci_high
+# Percentile CI: 2.5% and 97.5% from n_boot bootstrap samples
+# Resampling is done on the TEST SET rows / paired vectors
+# ============================================================
+
+# ---- helpers (small + boring, used by all) ----
+.rmse <- function(obs, pred) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  if (length(obs) == 0) return(NA_real_)
+  sqrt(mean((obs - pred)^2))
+}
+
+.safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]; y <- y[ok]
+  if (length(x) < 2) return(NA_real_)
+  if (sd(x) == 0 || sd(y) == 0) return(NA_real_)
+  cor(x, y, use = "complete.obs")
+}
+
+.ci_from_boot <- function(boot_vals, conf = 0.95) {
+  alpha <- (1 - conf) / 2
+  boot_vals <- boot_vals[is.finite(boot_vals)]
+  if (length(boot_vals) == 0) {
+    return(list(ci_low = NA_real_, ci_high = NA_real_))
+  }
+  list(
+    ci_low  = as.numeric(stats::quantile(boot_vals, probs = alpha, na.rm = TRUE)),
+    ci_high = as.numeric(stats::quantile(boot_vals, probs = 1 - alpha, na.rm = TRUE))
+  )
+}
+
+# ============================================================
+# 1) Normalized RMSE (normalized by SD of observed)
+# ============================================================
+metric_nrmse_ci <- function(obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  denom <- sd(obs)
+  est <- if (!is.finite(denom) || denom == 0) NA_real_ else .rmse(obs, pred) / denom
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    o <- obs[idx]; p <- pred[idx]
+    d <- sd(o)
+    if (!is.finite(d) || d == 0) return(NA_real_)
+    .rmse(o, p) / d
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 2) Correlation coefficient (Pearson)
+# ============================================================
+metric_cor_ci <- function(obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  est <- .safe_cor(obs, pred)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    .safe_cor(obs[idx], pred[idx])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 3) Skill score (Perkins S-score)
+# ============================================================
+metric_sscore_ci <- function(obs, pred, nbins = 15,
+                             n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calculate_sscore <- function(obs, pred, nbins = 15) {
+    min_val <- min(c(obs, pred))
+    max_val <- max(c(obs, pred))
+    if (!is.finite(min_val) || !is.finite(max_val) || min_val == max_val) return(NA_real_)
+
+    breaks <- seq(min_val, max_val, length.out = nbins + 1)
+    hist_obs  <- hist(obs,  breaks = breaks, plot = FALSE)
+    hist_pred <- hist(pred, breaks = breaks, plot = FALSE)
+
+    prob_obs  <- hist_obs$counts  / sum(hist_obs$counts)
+    prob_pred <- hist_pred$counts / sum(hist_pred$counts)
+
+    sum(pmin(prob_obs, prob_pred))
+  }
+
+  est <- calculate_sscore(obs, pred, nbins = nbins)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calculate_sscore(obs[idx], pred[idx], nbins = nbins)
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 4) Spatial correlation
+#    (correlation of gridcell means across space)
+#    test must contain lon, lat, and strikes (obs)
+# ============================================================
+metric_spatial_cor_ci <- function(test, y_pred,
+                                  n_boot = 1000, conf = 0.95, seed = 123) {
+  test <- dplyr::as_tibble(test)
+  test$pred <- y_pred
+  test <- test %>% dplyr::filter(is.finite(strikes), is.finite(pred))
+  if (nrow(test) == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  # Point estimate — spatial means across all observations
+  spatial_means <- test %>%
+    dplyr::group_by(lon, lat) %>%
+    dplyr::summarise(
+      obs_mean  = mean(strikes, na.rm = TRUE),
+      pred_mean = mean(pred,    na.rm = TRUE),
+      .groups = "drop"
+    )
+  est <- .safe_cor(spatial_means$obs_mean, spatial_means$pred_mean)
+
+  # Bootstrap by resampling grid cells (the unit of analysis)
+  unique_cells <- dplyr::distinct(test, lon, lat)
+  n_cells <- nrow(unique_cells)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    sampled_cells <- unique_cells[sample.int(n_cells, size = n_cells, replace = TRUE), ]
+    sm <- sampled_cells %>%
+      dplyr::left_join(test, by = c("lon", "lat"),
+                   relationship = "many-to-many") %>%
+      dplyr::group_by(lon, lat) %>%
+      dplyr::summarise(
+        obs_mean  = mean(strikes, na.rm = TRUE),
+        pred_mean = mean(pred,    na.rm = TRUE),
+        .groups = "drop"
+      )
+    .safe_cor(sm$obs_mean, sm$pred_mean)
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 5) Anomaly Correlation Coefficient (ACC)
+#    computed from annual means, then anomalies, then correlation
+# ============================================================
+metric_acc_ci <- function(year, obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  df <- dplyr::tibble(year = year, obs = obs, pred = pred) %>%
+    dplyr::filter(is.finite(year), is.finite(obs), is.finite(pred))
+
+  N <- nrow(df)
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calc_acc_core <- function(df_in) {
+    annual <- df_in %>%
+      dplyr::group_by(year) %>%
+      dplyr::summarise(
+        obs  = mean(obs,  na.rm = TRUE),
+        pred = mean(pred, na.rm = TRUE),
+        .groups = "drop"
+      )
+    obs_anom  <- annual$obs  - mean(annual$obs,  na.rm = TRUE)
+    pred_anom <- annual$pred - mean(annual$pred, na.rm = TRUE)
+    .safe_cor(obs_anom, pred_anom)
+  }
+
+  est <- calc_acc_core(df)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calc_acc_core(df[idx, , drop = FALSE])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 6) Normalized RMSE of anomalies (nRMSE_anom)
+#    = RMSE(annual anomalies) / SD(observed annual anomalies)
+# ============================================================
+metric_nrmse_anom_ci <- function(year, obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  df <- dplyr::tibble(year = year, obs = obs, pred = pred) %>%
+    dplyr::filter(is.finite(year), is.finite(obs), is.finite(pred))
+
+  N <- nrow(df)
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calc_nrmse_anom_core <- function(df_in) {
+    annual <- df_in %>%
+      dplyr::group_by(year) %>%
+      dplyr::summarise(
+        obs  = mean(obs,  na.rm = TRUE),
+        pred = mean(pred, na.rm = TRUE),
+        .groups = "drop"
+      )
+    obs_anom  <- annual$obs  - mean(annual$obs,  na.rm = TRUE)
+    pred_anom <- annual$pred - mean(annual$pred, na.rm = TRUE)
+
+    denom <- sd(obs_anom, na.rm = TRUE)
+    if (!is.finite(denom) || denom == 0) return(NA_real_)
+    sqrt(mean((obs_anom - pred_anom)^2, na.rm = TRUE)) / denom
+  }
+
+  est <- calc_nrmse_anom_core(df)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calc_nrmse_anom_core(df[idx, , drop = FALSE])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# Example calls
+# ============================================================
+# nrmse_res  <- metric_nrmse_ci(test$strikes, y_pred)
+# cor_res    <- metric_cor_ci(test$strikes, y_pred)
+# sscore_res <- metric_sscore_ci(test$strikes, y_pred, nbins = 15)
+# spcor_res  <- metric_spatial_cor_ci(test=df, y_pred)
+# acc_res    <- metric_acc_ci(test$year, test$strikes, y_pred)
+# nrmseA_res <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred)
+
+```
+
+########################################
+#2002-2011 parameters -> 2012-2018 data
+#######################################
+
+Read in 2002-2011 lighting and climate data
+```{r}
+drivers_file_path <- file.path(drivers_root, "lightning_prediction_drivers_2002_2011.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+
+colnames(df) <- c("year", "lon", "lat", "strikes", "tair", "precip", "wind", "swr", "sp", "rh", "cape", "cxp")
+head(df)
+```
+
+Get mean and sd for 2002-2011 climate data to apply to the 2012-2018 data
+```{r}
+#Split into training and testing data
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+train <- df[train_index, ]
+test <- df[-train_index, ]
+#get mean and sd for each predictor
+mu_precip <- mean(train$precip)
+sigma_precip <- sd(train$precip)
+mu_tair <- mean(train$tair)
+sigma_tair <- sd(train$tair)
+mu_wind <- mean(train$wind)
+sigma_wind <- sd(train$wind)
+mu_swr <- mean(train$swr)
+sigma_swr <- sd(train$swr)
+mu_sp <- mean(train$sp)
+sigma_sp <- sd(train$sp)
+mu_rh <- mean(train$rh)
+sigma_rh <- sd(train$rh)
+mu_cape <- mean(train$cape)
+sigma_cape <- sd(train$cape)
+mu_cxp <- mean(train$cxp)
+sigma_cxp <- sd(train$cxp)
+```
+
+Read in 2012-2018 data and standardize using 2002-2011 mean and sds
+```{r}
+drivers_file_path <- file.path(drivers_root, "lightning_prediction_drivers_2012_2018.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+colnames(df) <- c("year", "lon", "lat", "strikes", "tair", "precip", "wind", "swr", "sp", "rh", "cape", "cxp")
+
+df <- df %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) %>%
+  mutate(cape = (cape-mu_cape)/sigma_cape) %>%
+  mutate(cxp = (cxp-mu_cxp)/sigma_cxp)
+
+head(df)
+```
+
+Get 'best' 2002-2011 model's parameters: Gamma GLM that uses near surface variables. 
+
+```{r}
+table_file_path <- file.path(table_root, "lightning_model_coefficients_2002_2011.csv")
+model <- read.csv(table_file_path)
+head(model)
+
+#Using Gamma GLM
+
+#Original code used to fit the model:
+#G13 <- glm(strikes ~ swr + tair + rh + wind + precip + sp,
+                 #data = train,
+                 #family = Gamma(link =log))
+#y_pred3 <- exp(a + b*test$swr + c*test$tair + d*test$rh +e*test$wind + f*test$precip + g*test$sp)
+
+a <- model[6, 3]
+b <- model[6, 4]
+c <- model[6, 5]
+d <- model[6, 6]
+e <- model[6, 7]
+f <- model[6, 8]
+g <- model[6, 9]
+
+#calcualte strike rate:
+df <- mutate(df, y_pred = exp(a + 
+                        b*swr + 
+                        c*tair + 
+                        d*rh +
+                        e*wind + 
+                        f*precip + 
+                        g*sp))
+
+#Calculate performance metrics
+nrmse_res_1  <- metric_nrmse_ci(df$strikes, df$y_pred)
+cor_res_1    <- metric_cor_ci(df$strikes, df$y_pred)
+sscore_res_1 <- metric_sscore_ci(df$strikes, df$y_pred, nbins = 15)
+spcor_res_1  <- metric_spatial_cor_ci(test=df, df$y_pred)
+acc_res_1    <- metric_acc_ci(df$year, df$strikes, df$y_pred)
+nrmseA_res_1 <- metric_nrmse_anom_ci(df$year, df$strikes, df$y_pred)
+```
+
+########################################
+#2012-2018 parameters -> 2001-2011 data
+#######################################
+
+Read in 2012-2018 lighting and climate data
+```{r}
+drivers_file_path <- file.path(drivers_root, "lightning_prediction_drivers_2012_2018.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+
+colnames(df) <- c("year", "lon", "lat", "strikes", "tair", "precip", "wind", "swr", "sp", "rh", "cape", "cxp")
+head(df)
+```
+
+Get mean and sd for 2012-2018 climate data to apply to the 2002-2011 data
+```{r}
+#Split into training and testing data
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+train <- df[train_index, ]
+test <- df[-train_index, ]
+#get mean and sd for each predictor
+mu_precip <- mean(train$precip)
+sigma_precip <- sd(train$precip)
+mu_tair <- mean(train$tair)
+sigma_tair <- sd(train$tair)
+mu_wind <- mean(train$wind)
+sigma_wind <- sd(train$wind)
+mu_swr <- mean(train$swr)
+sigma_swr <- sd(train$swr)
+mu_sp <- mean(train$sp)
+sigma_sp <- sd(train$sp)
+mu_rh <- mean(train$rh)
+sigma_rh <- sd(train$rh)
+mu_cape <- mean(train$cape)
+sigma_cape <- sd(train$cape)
+mu_cxp <- mean(train$cxp)
+sigma_cxp <- sd(train$cxp)
+```
+
+Read in 2002-2011 data and standardize using 2012-2018 mean and sds
+```{r}
+drivers_file_path <- file.path(drivers_root, "lightning_prediction_drivers_2002_2011.csv")
+df <- read.csv(drivers_file_path)[,2:13]
+colnames(df) <- c("year", "lon", "lat", "strikes", "tair", "precip", "wind", "swr", "sp", "rh", "cape", "cxp")
+
+df <- df %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) %>%
+  mutate(cape = (cape-mu_cape)/sigma_cape) %>%
+  mutate(cxp = (cxp-mu_cxp)/sigma_cxp)
+
+head(df)
+```
+
+Get 'best' 2012-2018 model's parameters: Gamma GLM that uses near surface variables. 
+
+```{r}
+table_file_path <- file.path(table_root, "lightning_model_coefficients_2012_2018.csv")
+model <- read.csv(table_file_path)
+head(model)
+
+#Using Gamma GLM
+
+#Original code used to fit the model:
+#G13 <- glm(strikes ~ swr + tair + rh + wind + precip + sp,
+                 #data = train,
+                 #family = Gamma(link =log))
+#y_pred3 <- exp(a + b*test$swr + c*test$tair + d*test$rh +e*test$wind + f*test$precip + g*test$sp)
+
+a <- model[6, 3]
+b <- model[6, 4]
+c <- model[6, 5]
+d <- model[6, 6]
+e <- model[6, 7]
+f <- model[6, 8]
+g <- model[6, 9]
+
+#calcualte strike rate:
+df <- mutate(df, y_pred = exp(a + 
+                        b*swr + 
+                        c*tair + 
+                        d*rh +
+                        e*wind + 
+                        f*precip + 
+                        g*sp))
+
+#Calculate performance metrics
+nrmse_res_2  <- metric_nrmse_ci(df$strikes, df$y_pred)
+cor_res_2    <- metric_cor_ci(df$strikes, df$y_pred)
+sscore_res_2 <- metric_sscore_ci(df$strikes, df$y_pred, nbins = 15)
+spcor_res_2  <- metric_spatial_cor_ci(test=df, df$y_pred)
+acc_res_2    <- metric_acc_ci(df$year, df$strikes, df$y_pred)
+nrmseA_res_2 <- metric_nrmse_anom_ci(df$year, df$strikes, df$y_pred)
+```
+
+```{r}
+nrmse <- c(nrmse_res_1$estimate, nrmse_res_2$estimate)
+cor <- c(cor_res_1$estimate, cor_res_2$estimate)
+sscore <- c(sscore_res_1$estimate, sscore_res_2$estimate)
+spcor <- c(spcor_res_1$estimate, spcor_res_2$estimate)
+acc <- c(acc_res_1$estimate, acc_res_2$estimate)
+nrmseA <- c(nrmseA_res_1$estimate, nrmseA_res_2$estimate)
+
+nrmse_ci_low <- c(nrmse_res_1$ci_low, nrmse_res_2$ci_low)
+cor_ci_low <- c(cor_res_1$ci_low, cor_res_2$ci_low)
+sscore_ci_low <- c(sscore_res_1$ci_low, sscore_res_2$ci_low)
+spcor_ci_low <- c(spcor_res_1$ci_low, spcor_res_2$ci_low)
+acc_ci_low <- c(acc_res_1$ci_low, acc_res_2$ci_low)
+nrmseA_ci_low <- c(nrmseA_res_1$ci_low, nrmseA_res_2$ci_low)
+
+nrmse_ci_high <- c(nrmse_res_1$ci_high, nrmse_res_2$ci_high)
+cor_ci_high <- c(cor_res_1$ci_high, cor_res_2$ci_high)
+sscore_ci_high <- c(sscore_res_1$ci_high, sscore_res_2$ci_high)
+spcor_ci_high <- c(spcor_res_1$ci_high, spcor_res_2$ci_high)
+acc_ci_high <- c(acc_res_1$ci_high, acc_res_2$ci_high)
+nrmseA_ci_high <- c(nrmseA_res_1$ci_high, nrmseA_res_2$ci_high)
+
+name <- c("G13","G13")
+
+predictors <- rep("RH + Rsds + T + Ps + Pr + U10", 2)
+
+model <- rep(c("Gamma GLM"),2)
+
+training_period <- c("2002-2011", "2012-2018")
+
+input <- c("2012-2018", "2002-2011")
+
+performance <- data.frame(cbind(name, predictors, model, training_period, input, nrmse, nrmse_ci_low, nrmse_ci_high, cor, cor_ci_low, cor_ci_high, sscore, sscore_ci_low, sscore_ci_high, spcor, spcor_ci_low, spcor_ci_high, acc, acc_ci_low, acc_ci_high, nrmseA, nrmseA_ci_low, nrmseA_ci_high))
+
+
+```
+
+
+#compare with perfomance metrics calculated for tain sets
+```{r}
+table_file_path <- file.path(table_root, "lightning_model_performance.csv")
+performance_df <- read.csv(table_file_path)
+performance_df <- performance_df %>% dplyr::select(-X)
+#add temporal transferability test
+input <- rep("test data", nrow(performance_df)) #need to add a column  for the input data used to calculated the metrics
+performance_df <- performance_df %>% 
+  mutate(input = input, .after = training_period)
+
+#bind new metric values
+performance_df <- rbind(performance_df, performance)
+
+performance_df[6:23] <- lapply(performance_df[6:23], as.numeric)
+
+write.csv(performance_df, file.path(table_root, "lightning_model_performance_time_transfer_test.csv"))
+```
+
+Compare with performance calculated on test set across all gamma GLMs
+```{r}
+glm <- filter(performance_df, name=="G13")
+glm
+```
+
+```{r}
+library(tidyverse)
+library(scales)
+library(cowplot)
+
+# ── 1. Data preparation ───────────────────────────────────────────────────────
+
+desired_order <- c("CAPE", "CAPE x Pr", "RH + Rsds + T + Ps + Pr + U10")
+
+# In-period test set rows (input == "test data")
+df_inperiod <- performance_df %>%
+  filter(input == "test data") %>%
+  mutate(
+    training_period = if_else(training_period == "2001-2012", "2002-2011", training_period),
+    facet_group = "In-period test set",
+    y_label     = predictors
+  )
+
+# Cross-period transferability rows (input != "test data")
+df_transfer <- performance_df %>%
+  filter(input != "test data") %>%
+  mutate(
+    facet_group = "Temporal\ntransferability",
+    y_label     = paste0(training_period, " \u2192 ", input)  # e.g. "2002-2011 → 2012-2018"
+  )
+
+# Combine and set factor levels
+df_plot <- bind_rows(df_inperiod, df_transfer) %>%
+  mutate(
+    facet_group = factor(facet_group,
+                         levels = c("Temporal\ntransferability", "In-period test set")),
+    y_label = factor(y_label,
+                     levels = c("2012-2018 \u2192 2002-2011",
+                                "2002-2011 \u2192 2012-2018",
+                                desired_order)),
+    model           = factor(model, levels = c("LM", "Gamma GLM", "Gamma Bayesian")),
+    training_period = factor(training_period, levels = c("2002-2011", "2012-2018"))
+  )
+
+# ── 2. Shared aesthetics ──────────────────────────────────────────────────────
+
+color_vals <- c("LM" = "#0C7BDC", "Gamma GLM" = "purple4", "Gamma Bayesian" = "orange")
+shape_vals <- c("2002-2011" = 16, "2012-2018" = 17)
+dodge      <- position_dodge(width = 0.6)
+
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    axis.title.y     = element_blank(),
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey90", color = "grey70"),
+    strip.text.y     = element_text(size = 8, face = "bold", angle = 0),
+    axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin      = ggplot2::margin(t = 10, r = 10, b = 10, l = 30)
+  )
+
+# Helper: add shared facet + scale layers to a base plot
+add_facet_scales <- function(p) {
+  p +
+    facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+    scale_color_manual(values = color_vals, name = "Approach") +
+    scale_shape_manual(values = shape_vals,  name = "Training period") +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 18)) +
+    base_theme
+}
+
+# Helper: points + error bars for a given x variable
+pts_eb <- function(xvar, xmin_var, xmax_var) {
+  list(
+    geom_point(aes(x = .data[[xvar]]),
+               size = 2.8, alpha = 0.9, position = dodge),
+    geom_errorbarh(aes(xmin = .data[[xmin_var]], xmax = .data[[xmax_var]]),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge)
+  )
+}
+
+# ── 3. Individual panels ──────────────────────────────────────────────────────
+
+# (a) nRMSE — reversed axis, lower = better
+p_nrmse <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("nrmse", "nrmse_ci_low", "nrmse_ci_high") +
+    scale_x_reverse(breaks = seq(0, 14, by = 1),
+                    labels = label_number(accuracy = 1)) +
+    coord_cartesian(xlim = c(14, 0)) +
+    labs(x = "nRMSE") +
+    ggtitle("(a)")
+)
+
+p_nrmse <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("nrmse", "nrmse_ci_low", "nrmse_ci_high") +
+    scale_x_reverse(breaks = seq(0, 14, by = 1),
+                    labels = label_number(accuracy = 1),
+                    limits = c(14, 0)) +        # limits here, no coord_cartesian
+    labs(x = "nRMSE") +
+    ggtitle("(a)")
+)
+
+# (b) Correlation
+p_cor <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("cor", "cor_ci_low", "cor_ci_high") +
+    scale_x_continuous(breaks = seq(-0.1, 0.7, by = 0.2)) +
+    coord_cartesian(xlim = c(-0.15, 0.7)) +
+    labs(x = "Correlation") +
+    ggtitle("(b)")
+)
+
+# (c) S-score
+p_sscore <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("sscore", "sscore_ci_low", "sscore_ci_high") +
+    scale_x_continuous(breaks = seq(0.5, 1.0, by = 0.1)) +
+    coord_cartesian(xlim = c(0.5, 1.02)) +
+    labs(x = "S-score") +
+    ggtitle("(c)")
+)
+
+# (d) Spatial correlation
+p_spcor <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("spcor", "spcor_ci_low", "spcor_ci_high") +
+    scale_x_continuous(breaks = seq(0.0, 0.7, by = 0.1)) +
+    coord_cartesian(xlim = c(-0.05, 0.72)) +
+    labs(x = "Spatial Correlation") +
+    ggtitle("(d)")
+)
+
+# (e) ACC
+p_acc <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("acc", "acc_ci_low", "acc_ci_high") +
+    scale_x_continuous(breaks = seq(-1.0, 1.0, by = 0.2),
+                       labels = label_number(accuracy = 0.1)) +
+    coord_cartesian(xlim = c(-1.05, 1.0)) +
+    labs(x = "ACC") +
+    ggtitle("(e)")
+)
+
+# (f) nRMSE of anomalies — reversed axis, lower = better
+p_nrmseA <- add_facet_scales(
+  ggplot(df_plot, aes(y = y_label, color = model, shape = training_period)) +
+    pts_eb("nrmseA", "nrmseA_ci_low", "nrmseA_ci_high") +
+    scale_x_reverse(breaks = seq(0, 5, by = 0.5),
+                    labels = label_number(accuracy = 0.1)) +
+    coord_cartesian(xlim = c(5, 0)) +
+    labs(x = "nRMSE of Anomalies") +
+    ggtitle("(f)")
+)
+
+# ── 4. Shared legend ──────────────────────────────────────────────────────────
+
+legend_plot <- ggplot(df_plot,
+                      aes(x = nrmse, y = y_label,
+                          color = model, shape = training_period)) +
+  geom_point(size = 2.8) +
+  scale_color_manual(values = color_vals, name = "Approach") +
+  scale_shape_manual(values = shape_vals,  name = "Years") +
+  theme_void() +
+  theme(
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    legend.title     = element_text(size = 10),
+    legend.text      = element_text(size = 9)
+  )
+
+shared_legend <- get_legend(legend_plot)
+
+# ── 5. Assemble final figure ──────────────────────────────────────────────────
+
+fig_panels <- plot_grid(
+  p_nrmse, p_cor,
+  p_sscore, p_spcor,
+  p_acc,   p_nrmseA,
+  ncol = 2,
+  align = "hv"
+)
+
+final_fig <- plot_grid(
+  fig_panels,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.07)
+)
+
+final_fig
+
+# To save:
+ggsave(file.path(figure_root, "Figure_2.2.png"), plot = final_fig, width = 10, height = 9, dpi = 1100, units = "in")
+```
+

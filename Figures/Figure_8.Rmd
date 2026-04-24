@@ -1,0 +1,789 @@
+---
+54title: "Figure_8"
+author: "Charlotte Uden"
+date: "2026-03-06"
+output: html_document
+---
+
+Figure 8. Climate controls on modeled lightning strike rate, ignition efficiency, and lightning-caused fire probability in Alaska, 2002-2011. Heatmaps show the mean modeled response to combinations of daily near surface climate variables: temperature and relative humidity (a-c), temperature and precipitation (d-f), temperature and wind speed (g-i), relative humidity and precipitation (j-l), precipitation and wind speed (m-o), and relative humidity and wind speed (p-r). These climate variables were selected because they are applied in both the lightning and ignition efficiency models, allowing consistent comparison of their influence across models. Columns correspond to the three modeled components: lightning strike rate (strikes/month/km2; left), ignition efficiency (center), and fire probability (right). Colors indicate the mean model prediction within quantile-based climate bins with warmer colors indicating higher predicted values.
+
+
+```{r}
+
+library(tidyr)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths 
+```
+
+#Read in observations of fire occurance and predictions of r_strike, P_ignite, and P_fire
+```{r}
+df <- read.csv(file.path(drivers_root, "drivers_predictions_and_observations_2002-2011_10x.csv"))
+str(df)
+```
+
+
+Function to preprocess data for plotting
+```{r}
+plot_preprocess <- function(data, x_var, y_var, target_name, x_bins, y_bins, min_count) {
+  
+  # --- Clean + transform ---
+# Select only the necessary columns for this plot and transform
+  plot_df <- data %>%
+    dplyr::select(all_of(c(x_var, y_var, target_name))) %>%
+    mutate(across(everything(), as.numeric)) %>%
+    drop_na()
+
+# Add the log10 target column (floor to avoid -Inf for very small probabilities)
+  plot_df <- plot_df %>%
+    mutate(
+      !!log_target_col := log10(pmax(.data[[target_name]], 1e-15))
+      )
+
+# --- Binning and Aggregation for the single heatmap ---
+
+# Calculate breaks for x_var (ie. temperature)
+  x_breaks <- quantile(plot_df[[x_var]], probs = seq(0, 1, length.out = x_bins + 1), na.rm = TRUE)
+  x_breaks <- unique(x_breaks) # Ensure breaks are unique
+  if (length(x_breaks) < 2) { # Fallback if not enough unique breaks
+    x_breaks <- pretty(plot_df[[x_var]], n = x_bins)
+    }
+
+# Calculate breaks for y_var (ie. precipitation)
+  y_breaks <- quantile(plot_df[[y_var]], probs = seq(0, 1, length.out = y_bins + 1), na.rm = TRUE)
+  y_breaks <- unique(y_breaks) # Ensure breaks are unique
+  if (length(y_breaks) < 2) { # Fallback if not enough unique breaks
+    y_breaks <- pretty(plot_df[[y_var]], n = y_bins)
+    }
+
+# Create bins and aggregate data
+  surf_df <- plot_df %>%
+    mutate(
+      x_bin = cut(.data[[x_var]], breaks = x_breaks, include.lowest = TRUE, labels = FALSE),
+      y_bin = cut(.data[[y_var]], breaks = y_breaks, include.lowest = TRUE, labels = FALSE)
+      ) %>%
+    group_by(x_bin, y_bin) %>%
+    summarise(
+      mean_target = mean(.data[[target_name]], na.rm = TRUE),
+      mean_log_target = mean(.data[[log_target_col]], na.rm = TRUE),#get mean of log column too
+      count = n(),
+      .groups = "drop"
+      ) %>%
+    filter(count >= min_count) %>% # Mask bins with too few samples
+    #mutate(count = ifelse(count < min_count, NA, count)) %>% #or make counts less than min_count NA
+    #filter(mean_target >= 0.00001) %>%
+    # Calculate bin midpoints for plotting
+    mutate(
+      xmid = (x_breaks[x_bin] + x_breaks[x_bin + 1]) / 2,
+      ymid = (y_breaks[y_bin] + y_breaks[y_bin + 1]) / 2
+      ) %>%
+    mutate(
+      xmin = x_breaks[x_bin],
+      xmax = x_breaks[x_bin + 1],
+      ymin = y_breaks[y_bin],
+      ymax = y_breaks[y_bin + 1]
+    )
+  return(surf_df)
+}
+```
+
+##########################
+Fire Probability
+##########################
+
+temp x RH
+```{r}
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="relative_humidity",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013),
+                       guide = "none") +
+  labs(
+    title = "(c)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Relative humidity (%)",
+    fill = "Fire probability"
+  )
+  
+p_fire_t_rh
+
+
+#temp x precip
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="precipitation",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013),
+                       guide = "none") +
+  labs(
+    title = "(f)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Precipitation (mm)",
+    fill = "Fire probability"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_fire_t_p
+
+
+#temp x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="wind",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013),
+                       guide = "none") +
+  labs(
+    title = "(i)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Wind (m/s)",
+    fill = "Fire probability"
+  )+theme_minimal(base_size = 12) 
+  
+p_fire_t_w
+
+
+#precip x rh
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="precipitation",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013),
+                       guide = "none") +
+  labs(
+    title = "(l)",
+    x = "Relative humidity (%)",
+    y = "Precipitation (mm)",
+    fill = "Fire probability"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_fire_p_rh
+
+
+#precip x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="wind", 
+                            y_var="precipitation",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013),
+                       guide = "none") +
+  labs(
+    title = "(o)",
+    x = "Wind (m/s)",
+    y = "Precipitation (mm)",
+    fill = "Fire probability"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_fire_p_w
+
+
+#relative humidity x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="wind",
+                            target_name="P_fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_fire_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.0013)) +
+  labs(
+    title = "(r)",
+    x = "Relative humidity (%)",
+    y = "Wind (m/s)",
+    fill = "Fire probability      "
+  ) + 
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 16)) +
+  guides(fill = guide_colorbar(
+    title.position = "top",      # Place the title above the color bar
+      barwidth = 20,               # Adjust bar width for better horizontal layout
+      barheight = 3,
+    label.theme = element_text(angle = 45, hjust = 1)
+  ))
+  
+p_fire_rh_w
+```
+
+
+
+```{r}
+p_fire_t_rh |p_fire_t_p | p_fire_t_w | p_fire_p_rh | p_fire_p_w | p_fire_rh_w
+
+
+```
+
+
+##########################
+Ignition Efficiency
+##########################
+
+temp x RH
+```{r}
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="relative_humidity",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.51),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(b)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Relative humidity (%)",
+    fill = "Ignition efficiency"
+  )
+  
+p_ignite_t_rh
+
+
+#temp x precip
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="precipitation",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.51),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(e)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Precipitation (mm)",
+    fill = "Ignition efficiency"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_ignite_t_p
+
+
+#temp x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="wind",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.51),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(h)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Wind (m/s)",
+    fill = "Ignition efficiency"
+  )+theme_minimal(base_size = 12) 
+  
+p_ignite_t_w
+
+
+#precip x rh
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="precipitation",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.51),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(k)",
+    x = "Relative humidity (%)",
+    y = "Precipitation (mm)",
+    fill = "Ignition efficiency"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_ignite_p_rh
+
+
+#precip x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="wind", 
+                            y_var="precipitation",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.51),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(n)",
+    x = "Wind (m/s)",
+    y = "Precipitation (mm)",
+    fill = "Ignition efficiency"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_ignite_p_w
+
+
+#relative humidity x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="wind",
+                            target_name="P_ignite_prob",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_ignite_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.1),
+                       limits = c(0, 0.51)
+                       ) +
+  labs(
+    title = "(q)",
+    x = "Relative humidity (%)",
+    y = "Wind (m/s)",
+    fill = "Ignition efficiency     "
+  ) + 
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 16)) +
+  guides(fill = guide_colorbar(
+    title.position = "top",      # Place the title above the color bar
+      barwidth = 20,               # Adjust bar width for better horizontal layout
+      barheight = 3,
+    label.theme = element_text(angle = 45, hjust = 1)
+  ))
+  
+p_ignite_rh_w
+```
+
+
+```{r}
+p_ignite_t_rh |p_ignite_t_p | p_ignite_t_w | p_ignite_p_rh | p_ignite_p_w | p_ignite_rh_w
+
+```
+
+
+##########################
+Strike rate
+##########################
+
+temp x RH
+```{r}
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="relative_humidity",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.06),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(a)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Relative humidity (%)",
+    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+  )
+  
+p_r_strike_t_rh
+
+
+#temp x precip
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="precipitation",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.06),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(d)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Precipitation (mm)",
+    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_r_strike_t_p
+
+
+#temp x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="wind",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.06),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(g)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Wind (m/s)",
+    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+  ) + theme_minimal(base_size = 12) 
+  
+p_r_strike_t_w
+
+
+#precip x rh
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="precipitation",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.06),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(j)",
+    x = "Relative humidity (%)",
+    y = "Precipitation (mm)",
+    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_r_strike_p_rh
+
+
+#precip x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="wind", 
+                            y_var="precipitation",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.06),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(m)",
+    x = "Wind (m/s)",
+    y = "Precipitation (mm)",
+    fill = expression(atop("Predicted lightning strike rate", "strikes/month/km"^2))
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_r_strike_p_w
+
+
+#relative humidity x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="wind",
+                            target_name="r_strike",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_r_strike_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.01),
+                       limits = c(0, 0.06)
+                       ) +
+  labs(
+    title = "(p)",
+    x = "Relative humidity (%)",
+    y = "Wind (m/s)",
+    fill = "Strike rate     "
+  ) + 
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 16)) +
+  guides(fill = guide_colorbar(
+    title.position = "top",      # Place the title above the color bar
+      barwidth = 20,               # Adjust bar width for better horizontal layout
+      barheight = 3,
+    label.theme = element_text(angle = 45, hjust = 1)
+  ))
+  
+p_r_strike_rh_w
+```
+
+```{r}
+p_r_strike_t_rh |p_r_strike_t_p | p_r_strike_t_w | p_r_strike_p_rh | p_r_strike_p_w | p_r_strike_rh_w
+
+```
+
+##########################
+Observed Fire Rate
+##########################
+
+temp x RH
+```{r}
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="relative_humidity",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_t_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(a)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Relative humidity (%)",
+    fill = "Observed fire rate"
+  )
+  
+p_obs_fire_t_rh
+
+
+#temp x precip
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="precipitation",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_t_p <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(b)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Precipitation (mm)",
+    fill = "Observed fire rate"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_obs_fire_t_p
+
+
+#temp x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="temperature", 
+                            y_var="wind",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_t_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(c)",
+    x = expression("Temperature ("*degree*C*")"),
+    y = "Wind (m/s)",
+    fill = "Observed fire rate"
+  )+theme_minimal(base_size = 12) 
+  
+p_obs_fire_t_w
+
+
+#precip x rh
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="precipitation",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_p_rh <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(d)",
+    x = "Relative humidity (%)",
+    y = "Precipitation (mm)",
+    fill = "Observed fire rate"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_obs_fire_p_rh
+
+
+#precip x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="wind", 
+                            y_var="precipitation",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_p_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005),
+                       guide = "none"
+                       ) +
+  labs(
+    title = "(e)",
+    x = "Wind (m/s)",
+    y = "Precipitation (mm)",
+    fill = "Observed fire rate"
+  ) + 
+  theme_minimal(base_size = 12) 
+  
+p_obs_fire_p_w
+
+
+#relative humidity x wind
+
+plot_dat <- plot_preprocess(data=df, 
+                            x_var="relative_humidity", 
+                            y_var="wind",
+                            target_name="fire",
+                            x_bins=40, y_bins=40, min_count=200)
+
+p_obs_fire_rh_w <- ggplot(plot_dat, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = mean_target)) +
+  geom_rect(color = NA) +
+  scale_fill_viridis_c(na.value = "grey50", labels = label_number(accuracy = 0.00001),
+                       limits = c(0, 0.005)
+                       ) +
+  labs(
+    title = "(f)",
+    x = "Relative humidity (%)",
+    y = "Wind (m/s)",
+    fill = "Observed fire rate      "
+  ) + 
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "bottom",
+        legend.title = element_text(size = 16)) +
+  guides(fill = guide_colorbar(
+    title.position = "top",      # Place the title above the color bar
+      barwidth = 20,               # Adjust bar width for better horizontal layout
+      barheight = 3,
+    label.theme = element_text(angle = 45, hjust = 1)
+  ))
+  
+p_obs_fire_rh_w
+```
+
+```{r}
+p_obs_fire_t_rh |p_obs_fire_t_p | p_obs_fire_t_w | p_obs_fire_p_rh | p_obs_fire_p_w | p_obs_fire_rh_w
+
+```
+
+```{r}
+p <- (p_r_strike_t_rh / p_r_strike_t_p / p_r_strike_t_w / p_r_strike_p_rh / p_r_strike_p_w / p_r_strike_rh_w)|(p_ignite_t_rh / p_ignite_t_p / p_ignite_t_w / p_ignite_p_rh / p_ignite_p_w / p_ignite_rh_w) | (p_fire_t_rh / p_fire_t_p / p_fire_t_w / p_fire_p_rh / p_fire_p_w / p_fire_rh_w)
+#(p_obs_fire_t_rh / p_obs_fire_t_p / p_obs_fire_t_w / p_obs_fire_p_rh / p_obs_fire_p_w / p_obs_fire_rh_w)
+
+
+```
+
+
+```{r}
+ggsave(file.path(figure_root, "Figure_8.png"), plot = p, width = 15, height = 30, dpi = 700, units = "in")
+```

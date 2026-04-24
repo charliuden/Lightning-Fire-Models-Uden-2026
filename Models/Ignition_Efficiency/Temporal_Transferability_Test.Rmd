@@ -1,0 +1,623 @@
+---
+title: "Temporal Transferability Test"
+author: "Charlotte Uden"
+date: "2026-04-19"
+output: html_document
+---
+
+Reviewer comment:
+The model(s) were fit and tested for 2002-2011 and 2012-2018. This makes sense from the standpoint of the sensor changes as described, however the results don’t mention any evaluation of RMSE, etc. outside of the fitting period so it’s hard to judge the efficacy of the results. Given the limited lightning data in Alaska, one solution could be to produce some evaluation statistics for the period not used in the fitting (i.e. model fit for 2002-2011 is evaluated also against the 2012-2018 period). Earlier lightning observations are also available starting in the early 1990s that could be helpful as another independent test set.
+
+Our Response:
+We agree that applying parameter estimates outside the fitting period would strengthen our assessment of model generalizability. We have taken your suggestion and, for the ‘best’ lightning and ignition models, applied parameters from each period to data from the alternate period to check for out-of-period performance. We calculated performance metrics from these new predictions and added them to Figures 2 and 3 for clear in-period and out-of-period comparison. Finally, we added sections 3.1.4 and 3.2.5, “Cross validation across time periods,” to the results section. 
+
+Notes:
+theyre asking for somethind a bit different from general model performance. They ask about temporal transferability. Their underlying concern seems to be: given that we eventually want to apply this framework to paleoclimate data spanning very different time periods, how confident can we be that model parameters estimated on one period generalize to another? A random split within a period tests interpolation; applying parameters across the two sensor eras tests something closer to the kind of temporal extrapolation your paleo application will require. This is a worth while distinction, and it is directly relevant to my paper's stated goals.
+
+1) Apply parameters from the 'best' 2002-2011 ignition model to predict ignition from 2012-2018 climate data and calculate performance metrics. How does the model perform in comparison with predictions made from the original training period?
+2) Apply parameters from the 'best' 2012-2018 ignition model to predict ignition from 2002-2011 climate data and again compare its performance with its performance on teh 2012-2018 data it was trained on?
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(pROC)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+#config <- read_properties("/path/to/config/file/my_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+
+# Use the values to build full paths (ie line 52)
+```
+
+Functions for calculating performance metrics
+```{r}
+# =============================================================================
+# Cross-period evaluation functions for fit_bayes_logit_ridge output
+#
+# Workflow:
+#   preds <- predict_bayes_logit(fit_obj, new_data)
+#   eval  <- evaluate_bayes_logit(fit_obj, new_data)
+# =============================================================================
+
+# ── Helper functions (mirrors those inside fit_bayes_logit_ridge) ─────────────
+
+.pr_auc_ap <- function(y_true, p_hat) {
+  o  <- order(p_hat, decreasing = TRUE)
+  y  <- y_true[o]
+  tp <- cumsum(y == 1)
+  fp <- cumsum(y == 0)
+  total_pos <- sum(y == 1)
+  if (total_pos == 0) return(NA_real_)
+  recall    <- tp / total_pos
+  precision <- tp / (tp + fp)
+  recall_prev <- c(0, recall[-length(recall)])
+  sum((recall - recall_prev) * precision)
+}
+
+.calibration_stats <- function(y_true, p_hat) {
+  eps      <- 1e-6
+  p_clipped <- pmin(pmax(p_hat, eps), 1 - eps)
+  logit_p  <- qlogis(p_clipped)
+  cal_fit  <- glm(y_true ~ logit_p, family = binomial())
+  coefs    <- coef(cal_fit)
+  list(intercept = unname(coefs[1]),
+       slope     = unname(coefs["logit_p"]))
+}
+
+# =============================================================================
+# predict_bayes_logit()
+#
+# Standardizes new_data using the *training period's* scale_values from the
+# fitted object, then generates predicted probabilities using posterior mean
+# coefficients.
+#
+# Arguments:
+#   fit_obj   : output of fit_bayes_logit_ridge()
+#   new_data  : data frame for the alternate period (unstandardized)
+#   response  : name of the binary outcome column (default "caused_fire")
+#
+# Returns a data frame with columns: observed, predicted_prob, predicted_class
+# =============================================================================
+
+# Logistic function for convenience
+logistic <- function(x) 1 / (1 + exp(-x))
+
+predict_bayes_logit <- function(fit,
+                                      newdata,
+                                      type = c("response", "link", "class"),
+                                      threshold = 0.5) {
+  type <- match.arg(type)
+
+  # 1. Get predictor names from the fitted object
+  preds <- fit$predictors
+
+  # Check that all predictors are present
+  missing_preds <- setdiff(preds, names(newdata))
+  if (length(missing_preds) > 0) {
+    stop("The following predictors are missing from newdata: ",
+         paste(missing_preds, collapse = ", "))
+  }
+
+  # 2. Get training means and sds from fit$scale_values
+  scale_vals <- fit$scale_values
+
+  # Handle several possible shapes: matrix, data.frame, or list
+  if (is.matrix(scale_vals) || is.data.frame(scale_vals)) {
+    if (!all(c("mean", "sd") %in% colnames(scale_vals))) {
+      stop("scale_values must have columns named 'mean' and 'sd'.")
+    }
+    mu <- scale_vals[, "mean"]
+    sd <- scale_vals[, "sd"]
+    # Name them by rownames if available
+    if (!is.null(rownames(scale_vals))) {
+      names(mu) <- rownames(scale_vals)
+      names(sd) <- rownames(scale_vals)
+    }
+  } else if (is.list(scale_vals) && all(c("mean", "sd") %in% names(scale_vals))) {
+    mu <- scale_vals$mean
+    sd <- scale_vals$sd
+  } else {
+    stop("Unsupported format for fit$scale_values.")
+  }
+
+  # Keep only the predictors used in the model, in correct order
+  mu <- mu[preds]
+  sd <- sd[preds]
+
+  # 3. Build design matrix and standardize with training stats
+  X <- as.matrix(newdata[, preds, drop = FALSE])
+
+  X_scaled <- sweep(X, 2, mu, FUN = "-")
+  X_scaled <- sweep(X_scaled, 2, sd, FUN = "/")
+
+  # 4. Coefficients (posterior means)
+  alpha <- fit$coef_means$alpha
+  beta  <- fit$coef_means$beta[preds]
+
+  # 5. Linear predictor + probabilities
+  eta <- as.numeric(alpha + X_scaled %*% beta)
+  p   <- logistic(eta)
+
+  if (type == "link") {
+    return(eta)
+  } else if (type == "response") {
+    return(p)
+  } else {  # "class"
+    return(ifelse(p >= threshold, 1L, 0L))
+  }
+}
+
+
+# =============================================================================
+# evaluate_bayes_logit()
+#
+# Generates predictions on new_data (via predict_bayes_logit) and computes
+# all performance metrics with bootstrap CIs, mirroring the metrics in
+# fit_bayes_logit_ridge().
+#
+# Arguments:
+#   fit_obj   : output of fit_bayes_logit_ridge()
+#   new_data  : data frame for the alternate period (unstandardized)
+#   response  : name of the binary outcome column (default "caused_fire")
+#   boot      : whether to compute bootstrap CIs (default TRUE)
+#   n_boot    : number of bootstrap replicates (default 1000)
+#   seed      : random seed for reproducibility (default 123)
+#
+# Returns a list mirroring the $performance slot of fit_bayes_logit_ridge()
+# =============================================================================
+
+evaluate_bayes_logit <- function(fit_obj,
+                                 new_data,
+                                 response  = "caused_fire",
+                                 boot      = TRUE,
+                                 n_boot    = 1000,
+                                 seed      = 123) {
+
+  # ── 1. Generate predictions ───────────────────────────────────────────────
+  prob_test  <- predict_bayes_logit(fit_obj, newdata = new_data, type = "response")
+  y_test     <- new_data[[response]]
+  y_test <- as.numeric(as.character(new_data[[response]]))
+  class_test <- ifelse(prob_test >= 0.5, 1L, 0L)
+
+  # ── 2. Point estimates ────────────────────────────────────────────────────
+  roc_obj     <- pROC::roc(response = y_test, predictor = prob_test, quiet = TRUE)
+  auc_val     <- as.numeric(pROC::auc(roc_obj))
+  pr_auc_val  <- .pr_auc_ap(y_test, prob_test)
+  accuracy    <- mean(class_test == y_test)
+  brier       <- mean((prob_test - y_test)^2)
+  cal         <- .calibration_stats(y_test, prob_test)
+
+  # ── 3. Bootstrap CIs ──────────────────────────────────────────────────────
+  AUC_CI <- PR_AUC_CI <- ACC_CI <- Brier_CI <-
+    calib_int_CI <- calib_slope_CI <- c(NA_real_, NA_real_)
+
+  if (boot) {
+    n_test     <- length(y_test)
+    AUC_boot   <- numeric(n_boot)
+    PR_boot    <- numeric(n_boot)
+    ACC_boot   <- numeric(n_boot)
+    Brier_boot <- numeric(n_boot)
+    INT_boot   <- numeric(n_boot)
+    SLOPE_boot <- numeric(n_boot)
+
+    set.seed(seed)
+    for (b in seq_len(n_boot)) {
+      idx <- sample.int(n_test, n_test, replace = TRUE)
+      y_b <- y_test[idx]
+      p_b <- prob_test[idx]
+      c_b <- ifelse(p_b >= 0.5, 1L, 0L)
+
+      # ROC AUC
+      AUC_boot[b] <- if (length(unique(y_b)) == 2) {
+        tryCatch(
+          as.numeric(pROC::auc(pROC::roc(response = y_b, predictor = p_b, quiet = TRUE))),
+          error = function(e) NA_real_
+        )
+      } else NA_real_
+
+      # PR AUC
+      PR_boot[b]    <- .pr_auc_ap(y_b, p_b)
+
+      # Accuracy
+      ACC_boot[b]   <- mean(c_b == y_b)
+
+      # Brier
+      Brier_boot[b] <- mean((p_b - y_b)^2)
+
+      # Calibration
+      cal_b <- tryCatch(
+        .calibration_stats(y_b, p_b),
+        error = function(e) list(intercept = NA_real_, slope = NA_real_)
+      )
+      INT_boot[b]   <- cal_b$intercept
+      SLOPE_boot[b] <- cal_b$slope
+    }
+
+    qfun <- function(x) quantile(x[is.finite(x) & !is.na(x)], probs = c(0.025, 0.975))
+
+    if (any(is.finite(AUC_boot)))   AUC_CI         <- qfun(AUC_boot)
+    if (any(is.finite(PR_boot)))    PR_AUC_CI      <- qfun(PR_boot)
+    if (any(is.finite(ACC_boot)))   ACC_CI         <- qfun(ACC_boot)
+    if (any(is.finite(Brier_boot))) Brier_CI       <- qfun(Brier_boot)
+    if (any(is.finite(INT_boot)))   calib_int_CI   <- qfun(INT_boot)
+    if (any(is.finite(SLOPE_boot))) calib_slope_CI <- qfun(SLOPE_boot)
+  }
+
+  # ── 4. Return ─────────────────────────────────────────────────────────────
+  list(
+    predictions = data.frame(
+    observed        = y_test,
+    predicted_prob  = prob_test,
+    predicted_class = class_test
+  ),
+    performance = list(
+      AUC                = auc_val,
+      AUC_CI             = AUC_CI,
+      PR_AUC             = pr_auc_val,
+      PR_AUC_CI          = PR_AUC_CI,
+      accuracy           = accuracy,
+      accuracy_CI        = ACC_CI,
+      Brier              = brier,
+      Brier_CI           = Brier_CI,
+      calib_intercept    = cal$intercept,
+      calib_intercept_CI = calib_int_CI,
+      calib_slope        = cal$slope,
+      calib_slope_CI     = calib_slope_CI
+    )
+  )
+}
+
+
+```
+
+########################################
+#2002-2011 parameters -> 2012-2018 data
+#######################################
+Get 'best' 2002-2011 model's parameters: Bayesian logistic regression GLM that uses all predictors.
+```{r}
+#Read in drivers 
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2012_2018_10x.csv")
+data_2012_2018 <- read.csv(drivers_file_path)[,2:25]
+data_2012_2018 <- na.omit(data_2012_2018)
+#read in model
+model_path <- file.path(rds_root, "ignition_efficiency_bayes_models/m7.1_bayes_2001_2012_climate.rds")
+fit_2002_2011 <- readRDS(model_path)
+
+#make predictions: 2002-2011 model applied to 2012-2018 data and calculate metrics
+eval_early_to_late <- evaluate_bayes_logit(fit_2002_2011, data_2012_2018)
+
+#head(eval_early_to_late)
+```
+
+########################################
+#2012-2018 parameters -> 2001-2011 data
+#######################################
+
+```{r}
+#drivers
+drivers_file_path <- file.path(drivers_root, "ignition_efficiency_drivers_2002_2011_10x.csv")
+data_2002_2011 <- read.csv(drivers_file_path)#[,2:13]
+data_2002_2011 <- na.omit(data_2002_2011)
+#model
+model_path <- file.path(rds_root, "ignition_efficiency_bayes_models/m7.2_bayes_2012_2018_climate.rds")
+fit_2012_2018 <- readRDS(model_path)
+
+# 2012-2018 model applied to 2002-2011 data  
+eval_late_to_early <- evaluate_bayes_logit(fit_2012_2018, data_2002_2011)
+```
+
+Performance metrics calculated from in-period test data
+```{r}
+df <- read.csv(file.path(table_root, "ignition_efficiency_model_performance.csv"))
+```
+
+
+```{r}
+library(tidyverse)
+library(scales)
+library(gridExtra)
+library(grid)
+
+# =============================================================================
+# 1. Combine in-period and cross-period results
+# =============================================================================
+
+# -- Helper: extract metrics from evaluate_bayes_logit() output into a 1-row df
+extract_eval_metrics <- function(eval_obj, model_name, training_years,
+                                 approach, predictors, input) {
+  p <- eval_obj$performance
+  data.frame(
+    model          = model_name,
+    training_years = training_years,
+    approach       = approach,
+    predictors     = predictors,
+    input          = input,
+    AUC            = p$AUC,
+    PR_AUC         = p$PR_AUC,
+    accuracy       = p$accuracy,
+    Brier          = p$Brier,
+    calib_intercept = p$calib_intercept,
+    calib_slope    = p$calib_slope,
+    AUC_CI_low     = p$AUC_CI[1],
+    AUC_CI_high    = p$AUC_CI[2],
+    PR_AUC_CI_low  = p$PR_AUC_CI[1],
+    PR_AUC_CI_high = p$PR_AUC_CI[2],
+    Brier_CI_low   = p$Brier_CI[1],
+    Brier_CI_high  = p$Brier_CI[2],
+    calib_intercept_CI_low  = p$calib_intercept_CI[1],
+    calib_intercept_CI_high = p$calib_intercept_CI[2],
+    calib_slope_CI_low  = p$calib_slope_CI[1],
+    calib_slope_CI_high = p$calib_slope_CI[2],
+    stringsAsFactors = FALSE
+  )
+}
+
+# -- Add 'input' column to existing in-period df
+df_inperiod <- df %>%
+  mutate(input = "test data (in-period)")
+
+# -- Build cross-period rows from evaluate_bayes_logit() results
+# Replace eval_early_to_late and eval_late_to_early with your actual objects,
+# and adjust model/predictor labels to match your best selected models
+df_transfer <- bind_rows(
+  extract_eval_metrics(
+    eval_obj       = eval_early_to_late,
+    model_name     = "m7.1",
+    training_years = "2001-2012",
+    approach       = "Bayesian",
+    predictors     = "climate, fuel moisture & vegetation",
+    input          = "2012-2018"
+  ),
+  extract_eval_metrics(
+    eval_obj       = eval_late_to_early,
+    model_name     = "m7.1",
+    training_years = "2012-2018",
+    approach       = "Bayesian",
+    predictors     = "climate, fuel moisture & vegetation",
+    input          = "2001-2012"
+  )
+)
+
+# -- Combine and set factor levels
+desired_order <- c(
+  "climate", "fuel moisture", "vegetation",
+  "climate & fuel moisture", "climate & vegetation",
+  "fuel moisture & vegetation", "climate, fuel moisture & vegetation"
+)
+
+df_plot <- bind_rows(df_inperiod, df_transfer) %>%
+  mutate(
+    facet_group = case_when(
+      input == "test data (in-period)" ~ "In-period\ntest set",
+      TRUE                             ~ "Temporal\ntransferability"
+    ),
+    facet_group = factor(facet_group,
+                         levels = c("Temporal\ntransferability",
+                                    "In-period\ntest set")),
+    # y label: transferability rows show the arrow direction
+    y_label = case_when(
+      input == "2012-2018" ~ paste0(training_years, " \u2192 2012-2018"),
+      input == "2001-2012" ~ paste0(training_years, " \u2192 2001-2012"),
+      TRUE                 ~ as.character(predictors)
+    ),
+    y_label = factor(y_label,
+                     levels = c(
+                       paste0("2001-2012 \u2192 2012-2018"),
+                       paste0("2012-2018 \u2192 2001-2012"),
+                       desired_order
+                     )),
+    approach       = factor(approach, levels = c("glmnet", "Bayesian")),
+    training_years = factor(training_years, levels = c("2001-2012", "2012-2018"))
+  )
+
+#save for figure 3 script
+write.csv(df_plot, file.path(table_root, "ignition_efficiency_model_performance_time_transfer_test.csv"))
+
+head(df_plot)
+```
+
+```{r}
+# =============================================================================
+# 2. Shared plot elements
+# =============================================================================
+
+dodge <- position_dodge(width = 0.6)
+
+base_theme <- theme_bw(base_size = 11) +
+  theme(
+    axis.title.y     = element_blank(),
+    legend.position  = "none",
+    strip.background = element_rect(fill = "grey90", color = "grey70"),
+    strip.text.y     = element_text(size = 8, face = "bold", angle = 0),
+    axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin      = ggplot2::margin(t = 10, r = 10, b = 10, l = 30)
+  )
+
+add_facet <- function(p) {
+  p +
+    facet_grid(facet_group ~ ., scales = "free_y", space = "free_y") +
+    scale_color_brewer(palette = "Dark2", name = "Approach") +
+    scale_shape_manual(values = c("2001-2012" = 16, "2012-2018" = 17),
+                       name = "Training period") +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 25)) +
+    base_theme
+}
+
+# =============================================================================
+# 3. Individual panels
+# =============================================================================
+
+# (a) ROC AUC
+p_auc <- add_facet(
+  ggplot(df_plot,
+         aes(x = AUC, y = y_label, color = approach, shape = training_years)) +
+    geom_point(size = 2.8, alpha = 0.9, position = dodge) +
+    geom_errorbarh(aes(xmin = AUC_CI_low, xmax = AUC_CI_high),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge) +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(limits = c(0.4, 1.0),
+                       breaks = seq(0.4, 1.0, by = 0.1),
+                       labels = label_number(accuracy = 0.01)) +
+    labs(x = "ROC AUC") +
+    ggtitle("(a)")
+)
+
+# (b) PR AUC
+p_pr_auc <- add_facet(
+  ggplot(df_plot,
+         aes(x = PR_AUC, y = y_label, color = approach, shape = training_years)) +
+    geom_point(size = 2.8, alpha = 0.9, position = dodge) +
+    geom_errorbarh(aes(xmin = PR_AUC_CI_low, xmax = PR_AUC_CI_high),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge) +
+    scale_x_continuous(limits = c(0.2, 1.0),
+                       breaks = seq(0.2, 1.0, by = 0.1),
+                       labels = label_number(accuracy = 0.01)) +
+    scale_y_discrete(position = "right",
+                     labels = function(x) str_wrap(x, width = 25)) +
+    labs(x = "PR AUC") +
+    ggtitle("(b)") +
+    theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+)
+
+# (c) Brier Score — reversed axis, lower = better
+p_brier <- add_facet(
+  ggplot(df_plot,
+         aes(x = Brier, y = y_label, color = approach, shape = training_years)) +
+    geom_point(size = 2.8, alpha = 0.9, position = dodge) +
+    geom_errorbarh(aes(xmin = Brier_CI_low, xmax = Brier_CI_high),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge) +
+    scale_x_reverse(breaks = seq(0.43, 0.13, by = -0.02),
+                    labels = label_number(accuracy = 0.01),
+                    limits = c(0.43, 0.13)) +
+    labs(x = "Brier Score") +
+    ggtitle("(c)")
+)
+
+# (d) Calibration Intercept
+p_calib_intercept <- add_facet(
+  ggplot(df_plot,
+         aes(x = calib_intercept, y = y_label,
+             color = approach, shape = training_years)) +
+    geom_point(size = 2.8, alpha = 0.9, position = dodge) +
+    geom_errorbarh(aes(xmin = calib_intercept_CI_low,
+                       xmax = calib_intercept_CI_high),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(breaks = seq(-2, 30, by = 1),
+                       labels = label_number(accuracy = 1),
+                       limits = c(-2, 14)) +
+    scale_y_discrete(position = "right",
+                     labels = function(x) str_wrap(x, width = 25)) +
+    labs(x = "Calibration Intercept") +
+    ggtitle("(d)") +
+    theme(plot.margin = ggplot2::margin(t = 10, r = 30, b = 10, l = 10))
+)
+
+# (e) Calibration Slope
+p_calib_slope <- add_facet(
+  ggplot(df_plot,
+         aes(x = calib_slope, y = y_label,
+             color = approach, shape = training_years)) +
+    geom_point(size = 2.8, alpha = 0.9, position = dodge) +
+    geom_errorbarh(aes(xmin = calib_slope_CI_low,
+                       xmax = calib_slope_CI_high),
+                   height = 0.25, alpha = 0.6, linewidth = 0.5,
+                   position = dodge) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") +
+    scale_x_continuous(breaks = seq(-5, 111, by = 1),
+                       labels = label_number(accuracy = 1),
+                       limits = c(-4, 15)) +
+    labs(x = "Calibration Slope") +
+    ggtitle("(e)")
+)
+
+# =============================================================================
+# 4. Shared legend
+# =============================================================================
+
+legend_plot <- ggplot(df_plot,
+                      aes(x = AUC, y = y_label,
+                          color = approach, shape = training_years)) +
+  geom_point(size = 2.8) +
+  scale_color_brewer(palette = "Dark2", name = "Approach") +
+  scale_shape_manual(values = c("2001-2012" = 16, "2012-2018" = 17),
+                     name = "Years") +
+  theme_void() +
+  theme(
+    legend.position  = "bottom",
+    legend.box       = "horizontal",
+    legend.text      = element_text(size = 10),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.5, "cm"),
+    legend.spacing.x  = unit(0.5, "cm")
+  ) +
+  guides(color = guide_legend(ncol = 3),
+         shape = guide_legend(ncol = 3))
+
+extract_legend <- function(my_plot) {
+  g      <- ggplotGrob(my_plot)
+  legend <- g$grobs[which(sapply(g$grobs, function(x) x$name) == "guide-box")][[1]]
+  return(legend)
+}
+
+legend_grob <- extract_legend(legend_plot)
+blank_plot  <- ggplot() + theme_void()
+
+# =============================================================================
+# 5. Assemble and save
+# =============================================================================
+
+fig_panels <- plot_grid(
+  p_auc, p_pr_auc,
+  p_brier, p_calib_intercept,
+  p_calib_slope, blank_plot,
+  ncol = 2,
+  align = "hv"
+)
+
+final_fig <- plot_grid(
+  fig_panels,
+  legend_grob,
+  ncol = 1,
+  rel_heights = c(1, 0.07)
+)
+
+final_fig
+
+
+ggsave(file.path(figure_root, "Figure_3.2.png"),
+        plot = final_fig, width = 10, height = 9, dpi = 1100, units = "in")
+
+```
+
+
+
+
